@@ -6,6 +6,7 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "duckdb/main/secret/secret_manager.hpp"
 
 #ifdef USE_ZLIB
 #define CPPHTTPLIB_ZLIB_SUPPORT
@@ -141,7 +142,24 @@ namespace duckdb {
     }
 
     // Settings management
-    static std::string GetConfigValue(ClientContext &context, const string &var_name, const string &default_value) {
+    static std::string GetConfigValue(ClientContext &context, const std::string &var_name, const std::string &default_value) {
+        auto &secret_manager = SecretManager::Get(context);
+        auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+        auto secret_match = secret_manager.LookupSecret(transaction, "openprompt", var_name);
+
+        if (secret_match.HasMatch()) {
+            auto &secret = secret_match.GetSecret();
+            if (secret.GetType() == "open_prompt") {
+                const auto *kv_secret = dynamic_cast<const KeyValueSecret*>(&secret);
+                if (kv_secret) {
+                    Value secret_value;
+                    if (kv_secret->TryGetValue(var_name, secret_value)) {
+                        return secret_value.ToString();
+                    }
+                }
+            }
+        }
+
         Value value;
         auto &config = ClientConfig::GetConfig(context);
         if (!config.GetUserVariable(var_name, value) || value.IsNull()) {
