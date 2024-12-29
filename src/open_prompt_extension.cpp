@@ -20,6 +20,9 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.hpp"
 
+#include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <sstream>
 #include <mutex>
@@ -148,7 +151,16 @@ namespace duckdb {
 
     // Settings management
     static std::string GetConfigValue(ClientContext &context, const string &var_name, const string &default_value) {
-	    // First try to get from secrets
+
+	    // Try environment variables
+	    std::string env_var_name = "OPEN_PROMPT_" + var_name;
+	    std::transform(env_var_name.begin(), env_var_name.end(), env_var_name.begin(), ::toupper);
+	    const char* env_value = std::getenv(env_var_name.c_str());
+	    if (env_value != nullptr && strlen(env_value) > 0) {
+	        return std::string(env_value);
+	    }
+
+	    // Try to get from secrets
 	    auto &secret_manager = SecretManager::Get(context);
 	    try {
 	        auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);

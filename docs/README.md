@@ -42,6 +42,15 @@ CREATE SECRET IF NOT EXISTS open_prompt (
   );
 ```
 
+Alternatively the following ENV variables can be used at runtime
+```
+   OPEN_PROMPT_API_URL
+   OPEN_PROMPT_API_TOKEN
+   OPEN_PROMPT_MODEL_NAME
+   OPEN_PROMPT_API_TIMEOUT
+```
+
+
 ### Usage
 ```sql
 D SELECT open_prompt('Write a one-line poem about ducks') AS response;
