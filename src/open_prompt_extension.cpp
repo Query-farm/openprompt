@@ -7,6 +7,12 @@
 #include "duckdb/common/exception/http_exception.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
+#include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/main/secret/secret.hpp"
+#include "duckdb/main/secret/secret_storage.hpp"
+
+#include "open_prompt_secret.hpp"
+
 #ifdef USE_ZLIB
 #define CPPHTTPLIB_ZLIB_SUPPORT
 #endif
@@ -142,13 +148,40 @@ namespace duckdb {
 
     // Settings management
     static std::string GetConfigValue(ClientContext &context, const string &var_name, const string &default_value) {
-        Value value;
-        auto &config = ClientConfig::GetConfig(context);
-        if (!config.GetUserVariable(var_name, value) || value.IsNull()) {
-            return default_value;
-        }
-        return value.ToString();
+	    // First try to get from secrets
+	    auto &secret_manager = SecretManager::Get(context);
+	    try {
+	        auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	        auto secret_match = secret_manager.LookupSecret(transaction, "open_prompt", "open_prompt");
+	        if (secret_match.HasMatch()) {
+	            auto &secret = secret_match.GetSecret();
+	            if (secret.GetType() != "open_prompt") {
+	                throw InvalidInputException("Invalid secret type. Expected 'open_prompt', got '%s'", secret.GetType());
+	            }
+
+	            const auto *kv_secret = dynamic_cast<const KeyValueSecret*>(&secret);
+	            if (!kv_secret) {
+	                throw InvalidInputException("Invalid secret format for 'open_prompt' secret");
+	            }
+
+	            Value secret_value;
+	            if (kv_secret->TryGetValue(var_name, secret_value)) {
+	                return secret_value.ToString();
+	            }
+	        }
+	    } catch (...) {
+	        // If secret lookup fails, fall back to user variables
+	    }
+
+	    // Fall back to user variables if secret not found
+	    Value value;
+	    auto &config = ClientConfig::GetConfig(context);
+	    if (!config.GetUserVariable(var_name, value) || value.IsNull()) {
+	        return default_value;
+	    }
+	    return value.ToString();
     }
+
 
     static void SetConfigValue(DataChunk &args, ExpressionState &state, Vector &result, 
                               const string &var_name, const string &value_type) {
@@ -355,6 +388,9 @@ namespace duckdb {
             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
             LogicalType::VARCHAR, OpenPromptRequestFunction,
             OpenPromptBind));
+
+	// Register Secret functions
+	CreateOpenPromptSecretFunctions::Register(instance);
 
         ExtensionUtil::RegisterFunction(instance, open_prompt);
 

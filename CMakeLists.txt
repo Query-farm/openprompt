@@ -14,7 +14,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include duckdb/third_party/httplib)
 
-set(EXTENSION_SOURCES src/open_prompt_extension.cpp)
+set(EXTENSION_SOURCES src/open_prompt_extension.cpp src/open_prompt_secret.cpp)
 
 if(MINGW)
   set(OPENSSL_USE_STATIC_LIBS TRUE)

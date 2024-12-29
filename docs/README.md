@@ -28,7 +28,18 @@ Setup the completions API configuration w/ optional auth token and model name
 SET VARIABLE openprompt_api_url = 'http://localhost:11434/v1/chat/completions';
 SET VARIABLE openprompt_api_token = 'your_api_key_here';
 SET VARIABLE openprompt_model_name = 'qwen2.5:0.5b';
+```
 
+For persistent usage, configure parameters using DuckDB SECRETS
+```sql
+CREATE SECRET IF NOT EXISTS open_prompt (
+      TYPE open_prompt,
+      PROVIDER config,
+      api_token 'your-api-token',
+      api_url 'http://localhost:11434/v1/chat/completions',
+      model_name 'qwen2.5:0.5b',
+      api_timeout '30'
+  );
 ```
 
 ### Usage
