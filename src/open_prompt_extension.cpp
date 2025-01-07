@@ -43,7 +43,7 @@ namespace duckdb {
 	    res->model_idx = model_idx;
 	    res->json_schema_idx = json_schema_idx;
 	    res->json_system_prompt_idx = json_system_prompt_idx;
-	    return std::unique_ptr<FunctionData>(std::move(res));
+	    return unique_ptr<FunctionData>(std::move(res));
 	};
         bool Equals(const FunctionData &other) const {
             return model_idx == other.Cast<OpenPromptData>().model_idx &&
