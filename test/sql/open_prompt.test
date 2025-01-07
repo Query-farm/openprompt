@@ -1,0 +1,31 @@
+# name: test/sql/rusty_quack.test
+# description: test rusty_quack extension
+# group: [quack]
+
+# Before we load the extension, this will fail
+statement error
+SELECT open_prompt('error');
+----
+Catalog Error: Scalar Function with name open_prompt does not exist!
+
+# Require statement will ensure the extension is loaded from now on
+require open_prompt
+
+# Confirm the extension works by setting a secret
+query I
+CREATE SECRET IF NOT EXISTS open_prompt (
+       TYPE open_prompt,
+       PROVIDER config,
+       api_token 'xxxxx',
+       api_url 'https://api.groq.com/openai/v1/chat/completions',
+       model_name 'llama-3.3-70b-versatile',
+       api_timeout '30'
+   );
+----
+true
+
+# Confirm the secret exists
+query I
+SELECT name FROM duckdb_secrets() WHERE name = 'open_prompt' ;
+----
+open_prompt
