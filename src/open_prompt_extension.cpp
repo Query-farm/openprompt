@@ -38,13 +38,13 @@ namespace duckdb {
         idx_t model_idx;
         idx_t json_schema_idx;
         idx_t json_system_prompt_idx;
-        unique_ptr<FunctionData> Copy() const {
-            auto res = make_uniq<OpenPromptData>();
-            res->model_idx = model_idx;
-            res->json_schema_idx = json_schema_idx;
-            res->json_system_prompt_idx = json_system_prompt_idx;
-            return res;
-        };
+        unique_ptr<FunctionData> Copy() const override {
+	    auto res = make_uniq<OpenPromptData>();
+	    res->model_idx = model_idx;
+	    res->json_schema_idx = json_schema_idx;
+	    res->json_system_prompt_idx = json_system_prompt_idx;
+	    return std::unique_ptr<FunctionData>(std::move(res));
+	};
         bool Equals(const FunctionData &other) const {
             return model_idx == other.Cast<OpenPromptData>().model_idx &&
                 json_schema_idx == other.Cast<OpenPromptData>().json_schema_idx &&
