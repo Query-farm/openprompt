@@ -151,74 +151,68 @@ namespace duckdb {
 
     // Settings management
     static std::string GetConfigValue(ClientContext &context, const string &var_name, const string &default_value) {
-    // Try environment variables
-    {
-        // Create uppercase ENV version: OPEN_PROMPT_SETTING
-        std::string stripped_name = var_name;
-        const std::string prefix = "openprompt_";
-        if (stripped_name.substr(0, prefix.length()) == prefix) {
-            stripped_name = stripped_name.substr(prefix.length());
-        }
-        std::string env_var_name = "OPEN_PROMPT_" + stripped_name;
-        std::transform(env_var_name.begin(), env_var_name.end(), env_var_name.begin(), ::toupper);
-	// std::cout << "SEARCH ENV FOR " << env_var_name << "\n"; 
-        
-        const char* env_value = std::getenv(env_var_name.c_str());
-        if (env_value != nullptr && strlen(env_value) > 0) {
-	    // std::cout << "USING ENV FOR " << var_name << "\n"; 
-            std::string result(env_value);
-            return result;
-        }
+	    // Try SET value from current session
+	    {
+		Value value;
+		auto &config = ClientConfig::GetConfig(context);
+		if (config.GetUserVariable(var_name, value) && strlen(value) > 0) {
+		   return value.ToString();
+		}
+	    }
+	    // Try GET environment variables
+	    {
+	        // Create uppercase ENV version: OPEN_PROMPT_SETTING
+	        std::string stripped_name = var_name;
+	        const std::string prefix = "openprompt_";
+	        if (stripped_name.substr(0, prefix.length()) == prefix) {
+	            stripped_name = stripped_name.substr(prefix.length());
+	        }
+	        std::string env_var_name = "OPEN_PROMPT_" + stripped_name;
+	        std::transform(env_var_name.begin(), env_var_name.end(), env_var_name.begin(), ::toupper);
+	        
+	        const char* env_value = std::getenv(env_var_name.c_str());
+	        if (env_value != nullptr && strlen(env_value) > 0) {
+	            std::string result(env_value);
+	            return result;
+	        }
+	    }
+	    // Try GET from secrets
+	    {
+	        // Create lowercase secret version: open_prompt_setting
+	        std::string secret_key = var_name;
+	        const std::string prefix = "openprompt_";
+	        if (secret_key.substr(0, prefix.length()) == prefix) {
+	            secret_key = secret_key.substr(prefix.length());
+	        }
+	        // secret_key = "open_prompt_" + secret_key;
+	        std::transform(secret_key.begin(), secret_key.end(), secret_key.begin(), ::tolower);
+	
+	        auto &secret_manager = SecretManager::Get(context);
+	        try {
+	            auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	            auto secret_match = secret_manager.LookupSecret(transaction, "open_prompt", "open_prompt");
+	            if (secret_match.HasMatch()) {
+	                auto &secret = secret_match.GetSecret();
+	                if (secret.GetType() != "open_prompt") {
+	                    throw InvalidInputException("Invalid secret type. Expected 'open_prompt', got '%s'", secret.GetType());
+	                }
+	                const auto *kv_secret = dynamic_cast<const KeyValueSecret*>(&secret);
+	                if (!kv_secret) {
+	                    throw InvalidInputException("Invalid secret format for 'open_prompt' secret");
+	                }
+	                Value secret_value;
+	                if (kv_secret->TryGetValue(secret_key, secret_value)) {
+	                    return secret_value.ToString();
+	                }
+	            }
+	        } catch (...) {
+	            // If secret lookup fails, fall back to user variables
+		    return default_value;
+	        }
+	    }
+    // Fall back to default value
+    return default_value;
     }
-
-    // Try to get from secrets
-    {
-        // Create lowercase secret version: open_prompt_setting
-        std::string secret_key = var_name;
-        const std::string prefix = "openprompt_";
-        if (secret_key.substr(0, prefix.length()) == prefix) {
-            secret_key = secret_key.substr(prefix.length());
-        }
-        // secret_key = "open_prompt_" + secret_key;
-        std::transform(secret_key.begin(), secret_key.end(), secret_key.begin(), ::tolower);
-
-        auto &secret_manager = SecretManager::Get(context);
-        try {
-   	    // std::cout << "SEARCH SECRET FOR " << secret_key << "\n"; 
-            auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-            auto secret_match = secret_manager.LookupSecret(transaction, "open_prompt", "open_prompt");
-            if (secret_match.HasMatch()) {
-                auto &secret = secret_match.GetSecret();
-                if (secret.GetType() != "open_prompt") {
-                    throw InvalidInputException("Invalid secret type. Expected 'open_prompt', got '%s'", secret.GetType());
-                }
-                const auto *kv_secret = dynamic_cast<const KeyValueSecret*>(&secret);
-                if (!kv_secret) {
-                    throw InvalidInputException("Invalid secret format for 'open_prompt' secret");
-                }
-                Value secret_value;
-                if (kv_secret->TryGetValue(secret_key, secret_value)) {
-	            // std::cout << "USING SECRET FOR " << var_name << "\n"; 
-                    return secret_value.ToString();
-                }
-            }
-        } catch (...) {
-            // If secret lookup fails, fall back to user variables
-        }
-    }
-
-    // Fall back to user variables if secret not found (using original var_name)
-    Value value;
-    auto &config = ClientConfig::GetConfig(context);
-    if (!config.GetUserVariable(var_name, value) || value.IsNull()) {
-        // std::cout << "USING SET FOR " << var_name << "\n"; 
-        return default_value;
-    }
-
-    // std::cout << "USING DEFAULT FOR " << var_name << "\n"; 
-    return value.ToString();
-    }
-
 
     static void SetConfigValue(DataChunk &args, ExpressionState &state, Vector &result, 
                               const string &var_name, const string &value_type) {
