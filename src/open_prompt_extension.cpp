@@ -155,7 +155,7 @@ namespace duckdb {
 	    {
 		Value value;
 		auto &config = ClientConfig::GetConfig(context);
-		if (config.GetUserVariable(var_name, value) && strlen(value.ToString()) > 0) {
+		if (config.GetUserVariable(var_name, value) && !value.IsNull()) {
 		   return value.ToString();
 		}
 	    }
