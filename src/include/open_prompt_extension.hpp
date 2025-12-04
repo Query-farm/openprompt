@@ -1,14 +1,13 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 namespace duckdb {
 
-using HeaderMap = case_insensitive_map_t<string>;
-
 class OpenPromptExtension : public Extension {
 public:
-    void Load(DuckDB &db) override;
+    void Load(ExtensionLoader &loader) override;
     std::string Name() override;
     std::string Version() const override;
 

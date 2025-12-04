@@ -2,7 +2,7 @@
 #include "open_prompt_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
@@ -45,7 +45,7 @@ namespace duckdb {
 	    res->json_system_prompt_idx = json_system_prompt_idx;
 	    return unique_ptr<FunctionData>(std::move(res));
 	};
-        bool Equals(const FunctionData &other) const {
+        bool Equals(const FunctionData &other) const override {
             return model_idx == other.Cast<OpenPromptData>().model_idx &&
                 json_schema_idx == other.Cast<OpenPromptData>().json_schema_idx &&
                 json_system_prompt_idx==other.Cast<OpenPromptData>().json_system_prompt_idx;
@@ -401,42 +401,118 @@ namespace duckdb {
             });
     }
 
-    // Complete LoadInternal function
-    static void LoadInternal(DatabaseInstance &instance) {
-        ScalarFunctionSet open_prompt("open_prompt");
+    static void LoadInternal(ExtensionLoader &loader) {
+        // Create open_prompt function set
+        ScalarFunctionSet open_prompt_set("open_prompt");
 
-        open_prompt.AddFunction(ScalarFunction(
-            {LogicalType::VARCHAR}, LogicalType::VARCHAR, OpenPromptRequestFunction,
-            OpenPromptBind));
-        open_prompt.AddFunction(ScalarFunction(
-            {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, OpenPromptRequestFunction,
-            OpenPromptBind));
-        open_prompt.AddFunction(ScalarFunction(
-            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-            LogicalType::VARCHAR, OpenPromptRequestFunction,
-            OpenPromptBind));
-        open_prompt.AddFunction(ScalarFunction(
-            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-            LogicalType::VARCHAR, OpenPromptRequestFunction,
-            OpenPromptBind));
+        // Single argument: prompt only
+        open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR,
+                                                   OpenPromptRequestFunction, OpenPromptBind));
 
-	// Register Secret functions
-	CreateOpenPromptSecretFunctions::Register(instance);
+        // Two arguments: prompt + model
+        open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                                   LogicalType::VARCHAR, OpenPromptRequestFunction, OpenPromptBind));
 
-        ExtensionUtil::RegisterFunction(instance, open_prompt);
+        // Three arguments: prompt + model + json_schema
+        open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                                   LogicalType::VARCHAR, OpenPromptRequestFunction, OpenPromptBind));
 
-        ExtensionUtil::RegisterFunction(instance, ScalarFunction(
-            "set_api_token", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetApiToken));
-        ExtensionUtil::RegisterFunction(instance, ScalarFunction(
-            "set_api_url", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetApiUrl));
-        ExtensionUtil::RegisterFunction(instance, ScalarFunction(
-            "set_model_name", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetModelName));
-        ExtensionUtil::RegisterFunction(instance, ScalarFunction(
-            "set_api_timeout", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetApiTimeout));
+        // Four arguments: prompt + model + json_schema + system_prompt
+        open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                                   LogicalType::VARCHAR, OpenPromptRequestFunction, OpenPromptBind));
+
+        // Create function info with documentation
+        CreateScalarFunctionInfo open_prompt_info(open_prompt_set);
+
+        // Document single argument variant
+        FunctionDescription desc1;
+        desc1.parameter_names = {"prompt"};
+        desc1.parameter_types = {LogicalType::VARCHAR};
+        desc1.description = "Send a prompt to an OpenAI-compatible LLM API and return the response";
+        desc1.examples = {"open_prompt('What is DuckDB?')"};
+        desc1.categories = {"ai"};
+        open_prompt_info.descriptions.push_back(desc1);
+
+        // Document two argument variant
+        FunctionDescription desc2;
+        desc2.parameter_names = {"prompt", "model"};
+        desc2.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+        desc2.description = "Send a prompt to an LLM API using a specific model";
+        desc2.examples = {"open_prompt('Explain SQL', 'gpt-4')"};
+        desc2.categories = {"ai"};
+        open_prompt_info.descriptions.push_back(desc2);
+
+        // Document three argument variant
+        FunctionDescription desc3;
+        desc3.parameter_names = {"prompt", "model", "json_schema"};
+        desc3.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+        desc3.description = "Send a prompt to an LLM API with structured JSON output";
+        desc3.examples = {"open_prompt('Extract name', 'gpt-4', '{\"type\":\"object\"}')"};
+        desc3.categories = {"ai"};
+        open_prompt_info.descriptions.push_back(desc3);
+
+        // Document four argument variant
+        FunctionDescription desc4;
+        desc4.parameter_names = {"prompt", "model", "json_schema", "system_prompt"};
+        desc4.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+        desc4.description = "Send a prompt to an LLM API with a system prompt and structured output";
+        desc4.examples = {"open_prompt('Hello', 'gpt-4', '{}', 'You are helpful')"};
+        desc4.categories = {"ai"};
+        open_prompt_info.descriptions.push_back(desc4);
+
+        loader.RegisterFunction(open_prompt_info);
+
+        // Register Secret functions
+        CreateOpenPromptSecretFunctions::Register(loader);
+
+        // Configuration helper functions with documentation
+        CreateScalarFunctionInfo set_token_info(ScalarFunction("set_api_token", {LogicalType::VARCHAR},
+                                                               LogicalType::VARCHAR, SetApiToken));
+        FunctionDescription set_token_desc;
+        set_token_desc.parameter_names = {"token"};
+        set_token_desc.parameter_types = {LogicalType::VARCHAR};
+        set_token_desc.description = "Set the API token for LLM authentication";
+        set_token_desc.examples = {"set_api_token('sk-...')"};
+        set_token_desc.categories = {"ai", "configuration"};
+        set_token_info.descriptions.push_back(set_token_desc);
+        loader.RegisterFunction(set_token_info);
+
+        CreateScalarFunctionInfo set_url_info(ScalarFunction("set_api_url", {LogicalType::VARCHAR},
+                                                             LogicalType::VARCHAR, SetApiUrl));
+        FunctionDescription set_url_desc;
+        set_url_desc.parameter_names = {"url"};
+        set_url_desc.parameter_types = {LogicalType::VARCHAR};
+        set_url_desc.description = "Set the API URL for LLM endpoint";
+        set_url_desc.examples = {"set_api_url('https://api.openai.com/v1/chat/completions')"};
+        set_url_desc.categories = {"ai", "configuration"};
+        set_url_info.descriptions.push_back(set_url_desc);
+        loader.RegisterFunction(set_url_info);
+
+        CreateScalarFunctionInfo set_model_info(ScalarFunction("set_model_name", {LogicalType::VARCHAR},
+                                                               LogicalType::VARCHAR, SetModelName));
+        FunctionDescription set_model_desc;
+        set_model_desc.parameter_names = {"model"};
+        set_model_desc.parameter_types = {LogicalType::VARCHAR};
+        set_model_desc.description = "Set the default model name for LLM requests";
+        set_model_desc.examples = {"set_model_name('gpt-4')"};
+        set_model_desc.categories = {"ai", "configuration"};
+        set_model_info.descriptions.push_back(set_model_desc);
+        loader.RegisterFunction(set_model_info);
+
+        CreateScalarFunctionInfo set_timeout_info(ScalarFunction("set_api_timeout", {LogicalType::VARCHAR},
+                                                                 LogicalType::VARCHAR, SetApiTimeout));
+        FunctionDescription set_timeout_desc;
+        set_timeout_desc.parameter_names = {"timeout_seconds"};
+        set_timeout_desc.parameter_types = {LogicalType::VARCHAR};
+        set_timeout_desc.description = "Set the API timeout in seconds for LLM requests";
+        set_timeout_desc.examples = {"set_api_timeout('30')"};
+        set_timeout_desc.categories = {"ai", "configuration"};
+        set_timeout_info.descriptions.push_back(set_timeout_desc);
+        loader.RegisterFunction(set_timeout_info);
     }
 
-    void OpenPromptExtension::Load(DuckDB &db) {
-        LoadInternal(*db.instance);
+    void OpenPromptExtension::Load(ExtensionLoader &loader) {
+        LoadInternal(loader);
     }
 
     std::string OpenPromptExtension::Name() {
@@ -454,14 +530,9 @@ namespace duckdb {
 } // namespace duckdb
 
 extern "C" {
-    DUCKDB_EXTENSION_API void open_prompt_init(duckdb::DatabaseInstance &db) {
-        duckdb::DuckDB db_wrapper(db);
-        db_wrapper.LoadExtension<duckdb::OpenPromptExtension>();
-    }
-
-    DUCKDB_EXTENSION_API const char *open_prompt_version() {
-        return duckdb::DuckDB::LibraryVersion();
-    }
+DUCKDB_CPP_EXTENSION_ENTRY(open_prompt, loader) {
+    duckdb::LoadInternal(loader);
+}
 }
 
 #ifndef DUCKDB_EXTENSION_MAIN

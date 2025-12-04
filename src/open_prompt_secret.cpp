@@ -1,7 +1,6 @@
 #include "open_prompt_secret.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/secret/secret.hpp"
-#include "duckdb/main/extension_util.hpp"
 
 namespace duckdb {
 
@@ -41,7 +40,7 @@ static unique_ptr<BaseSecret> CreateOpenPromptSecretFromConfig(ClientContext &co
     return std::move(result);
 }
 
-void CreateOpenPromptSecretFunctions::Register(DatabaseInstance &instance) {
+void CreateOpenPromptSecretFunctions::Register(ExtensionLoader &loader) {
     string type = "open_prompt";
 
     // Register the new type
@@ -49,12 +48,12 @@ void CreateOpenPromptSecretFunctions::Register(DatabaseInstance &instance) {
     secret_type.name = type;
     secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
     secret_type.default_provider = "config";
-    ExtensionUtil::RegisterSecretType(instance, secret_type);
+    loader.RegisterSecretType(secret_type);
 
     // Register the config secret provider
     CreateSecretFunction config_function = {type, "config", CreateOpenPromptSecretFromConfig};
     RegisterCommonSecretParameters(config_function);
-    ExtensionUtil::RegisterFunction(instance, config_function);
+    loader.RegisterFunction(config_function);
 }
 
 } // namespace duckdb
