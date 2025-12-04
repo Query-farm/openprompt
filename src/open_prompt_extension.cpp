@@ -12,6 +12,7 @@
 #include "duckdb/main/secret/secret_storage.hpp"
 
 #include "open_prompt_secret.hpp"
+#include "query_farm_telemetry.hpp"
 
 #ifdef USE_ZLIB
 #define CPPHTTPLIB_ZLIB_SUPPORT
@@ -31,26 +32,31 @@
 
 #include "yyjson.hpp"
 
-#include<stdio.h>
+#include <stdio.h>
 
-namespace duckdb {
-    struct OpenPromptData: FunctionData {
+namespace duckdb
+{
+    struct OpenPromptData : FunctionData
+    {
         idx_t model_idx;
         idx_t json_schema_idx;
         idx_t json_system_prompt_idx;
-	unique_ptr<FunctionData> Copy() const override {
-	    auto res = make_uniq<OpenPromptData>();
-	    res->model_idx = model_idx;
-	    res->json_schema_idx = json_schema_idx;
-	    res->json_system_prompt_idx = json_system_prompt_idx;
-	    return unique_ptr<FunctionData>(std::move(res));
-	};
-        bool Equals(const FunctionData &other) const override {
-            return model_idx == other.Cast<OpenPromptData>().model_idx &&
-                json_schema_idx == other.Cast<OpenPromptData>().json_schema_idx &&
-                json_system_prompt_idx==other.Cast<OpenPromptData>().json_system_prompt_idx;
+        unique_ptr<FunctionData> Copy() const override
+        {
+            auto res = make_uniq<OpenPromptData>();
+            res->model_idx = model_idx;
+            res->json_schema_idx = json_schema_idx;
+            res->json_system_prompt_idx = json_system_prompt_idx;
+            return unique_ptr<FunctionData>(std::move(res));
         };
-        OpenPromptData() {
+        bool Equals(const FunctionData &other) const override
+        {
+            return model_idx == other.Cast<OpenPromptData>().model_idx &&
+                   json_schema_idx == other.Cast<OpenPromptData>().json_schema_idx &&
+                   json_system_prompt_idx == other.Cast<OpenPromptData>().json_system_prompt_idx;
+        };
+        OpenPromptData()
+        {
             model_idx = 0;
             json_schema_idx = 0;
             json_system_prompt_idx = 0;
@@ -58,350 +64,410 @@ namespace duckdb {
     };
 
     unique_ptr<FunctionData> OpenPromptBind(ClientContext &context, ScalarFunction &bound_function,
-                                                           vector<unique_ptr<Expression>> &arguments) {
+                                            vector<unique_ptr<Expression>> &arguments)
+    {
         auto res = make_uniq<OpenPromptData>();
-        for (idx_t i = 1; i < arguments.size(); ++i) {
+        for (idx_t i = 1; i < arguments.size(); ++i)
+        {
             const auto &argument = arguments[i];
-            if (i == 1 && argument->alias.empty()) {
+            if (i == 1 && argument->alias.empty())
+            {
                 res->model_idx = i;
-            } else if (argument->alias == "json_schema") {
+            }
+            else if (argument->alias == "json_schema")
+            {
                 res->json_schema_idx = i;
-            } else if (argument->alias == "system_prompt") {
+            }
+            else if (argument->alias == "system_prompt")
+            {
                 res->json_system_prompt_idx = i;
             }
         }
         return std::move(res);
     }
 
-    static std::pair<duckdb_httplib_openssl::Client, std::string> SetupHttpClient(const std::string &url) {
+    static std::pair<duckdb_httplib_openssl::Client, std::string> SetupHttpClient(const std::string &url)
+    {
         std::string scheme, domain, path, client_url;
         size_t pos = url.find("://");
         std::string mod_url = url;
-        if (pos != std::string::npos) {
+        if (pos != std::string::npos)
+        {
             scheme = mod_url.substr(0, pos);
             mod_url.erase(0, pos + 3);
         }
 
         pos = mod_url.find("/");
-        if (pos != std::string::npos) {
+        if (pos != std::string::npos)
+        {
             domain = mod_url.substr(0, pos);
             path = mod_url.substr(pos);
-        } else {
+        }
+        else
+        {
             domain = mod_url;
             path = "/";
         }
 
         // Construct client url with scheme if specified
-        if (scheme.length() > 0) {
+        if (scheme.length() > 0)
+        {
             client_url = scheme + "://" + domain;
-        } else {
+        }
+        else
+        {
             client_url = domain;
         }
 
         duckdb_httplib_openssl::Client client(client_url);
-        client.set_read_timeout(20, 0);  // 20 seconds
+        client.set_read_timeout(20, 0);   // 20 seconds
         client.set_follow_location(true); // Follow redirects
 
         return std::make_pair(std::move(client), path);
     }
 
-    static void HandleHttpError(const duckdb_httplib_openssl::Result &res, const std::string &request_type) {
+    static void HandleHttpError(const duckdb_httplib_openssl::Result &res, const std::string &request_type)
+    {
         std::string err_message = "HTTP " + request_type + " request failed. ";
 
-        switch (res.error()) {
-            case duckdb_httplib_openssl::Error::Connection:
-                err_message += "Connection error.";
-                break;
-            case duckdb_httplib_openssl::Error::BindIPAddress:
-                err_message += "Failed to bind IP address.";
-                break;
-            case duckdb_httplib_openssl::Error::Read:
-                err_message += "Error reading response.";
-                break;
-            case duckdb_httplib_openssl::Error::Write:
-                err_message += "Error writing request.";
-                break;
-            case duckdb_httplib_openssl::Error::ExceedRedirectCount:
-                err_message += "Too many redirects.";
-                break;
-            case duckdb_httplib_openssl::Error::Canceled:
-                err_message += "Request was canceled.";
-                break;
-            case duckdb_httplib_openssl::Error::SSLConnection:
-                err_message += "SSL connection failed.";
-                break;
-            case duckdb_httplib_openssl::Error::SSLLoadingCerts:
-                err_message += "Failed to load SSL certificates.";
-                break;
-            case duckdb_httplib_openssl::Error::SSLServerVerification:
-                err_message += "SSL server verification failed.";
-                break;
-            case duckdb_httplib_openssl::Error::UnsupportedMultipartBoundaryChars:
-                err_message += "Unsupported characters in multipart boundary.";
-                break;
-            case duckdb_httplib_openssl::Error::Compression:
-                err_message += "Error during compression.";
-                break;
-            default:
-                err_message += "Unknown error.";
-                break;
+        switch (res.error())
+        {
+        case duckdb_httplib_openssl::Error::Connection:
+            err_message += "Connection error.";
+            break;
+        case duckdb_httplib_openssl::Error::BindIPAddress:
+            err_message += "Failed to bind IP address.";
+            break;
+        case duckdb_httplib_openssl::Error::Read:
+            err_message += "Error reading response.";
+            break;
+        case duckdb_httplib_openssl::Error::Write:
+            err_message += "Error writing request.";
+            break;
+        case duckdb_httplib_openssl::Error::ExceedRedirectCount:
+            err_message += "Too many redirects.";
+            break;
+        case duckdb_httplib_openssl::Error::Canceled:
+            err_message += "Request was canceled.";
+            break;
+        case duckdb_httplib_openssl::Error::SSLConnection:
+            err_message += "SSL connection failed.";
+            break;
+        case duckdb_httplib_openssl::Error::SSLLoadingCerts:
+            err_message += "Failed to load SSL certificates.";
+            break;
+        case duckdb_httplib_openssl::Error::SSLServerVerification:
+            err_message += "SSL server verification failed.";
+            break;
+        case duckdb_httplib_openssl::Error::UnsupportedMultipartBoundaryChars:
+            err_message += "Unsupported characters in multipart boundary.";
+            break;
+        case duckdb_httplib_openssl::Error::Compression:
+            err_message += "Error during compression.";
+            break;
+        default:
+            err_message += "Unknown error.";
+            break;
         }
         throw std::runtime_error(err_message);
     }
 
     // Settings management
-    static std::string GetConfigValue(ClientContext &context, const string &var_name, const string &default_value) {
-	    // Try SET value from current session
-	    {
-		Value value;
-		auto &config = ClientConfig::GetConfig(context);
-		if (config.GetUserVariable(var_name, value) && !value.IsNull()) {
-		   return value.ToString();
-		}
-	    }
-	    // Try GET environment variables
-	    {
-	        // Create uppercase ENV version: OPEN_PROMPT_SETTING
-	        std::string stripped_name = var_name;
-	        const std::string prefix = "openprompt_";
-	        if (stripped_name.substr(0, prefix.length()) == prefix) {
-	            stripped_name = stripped_name.substr(prefix.length());
-	        }
-	        std::string env_var_name = "OPEN_PROMPT_" + stripped_name;
-	        std::transform(env_var_name.begin(), env_var_name.end(), env_var_name.begin(), ::toupper);
-	        
-	        const char* env_value = std::getenv(env_var_name.c_str());
-	        if (env_value != nullptr && strlen(env_value) > 0) {
-	            std::string result(env_value);
-	            return result;
-	        }
-	    }
-	    // Try GET from secrets
-	    {
-	        // Create lowercase secret version: open_prompt_setting
-	        std::string secret_key = var_name;
-	        const std::string prefix = "openprompt_";
-	        if (secret_key.substr(0, prefix.length()) == prefix) {
-	            secret_key = secret_key.substr(prefix.length());
-	        }
-	        // secret_key = "open_prompt_" + secret_key;
-	        std::transform(secret_key.begin(), secret_key.end(), secret_key.begin(), ::tolower);
-	
-	        auto &secret_manager = SecretManager::Get(context);
-	        try {
-	            auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	            auto secret_match = secret_manager.LookupSecret(transaction, "open_prompt", "open_prompt");
-	            if (secret_match.HasMatch()) {
-	                auto &secret = secret_match.GetSecret();
-	                if (secret.GetType() != "open_prompt") {
-	                    throw InvalidInputException("Invalid secret type. Expected 'open_prompt', got '%s'", secret.GetType());
-	                }
-	                const auto *kv_secret = dynamic_cast<const KeyValueSecret*>(&secret);
-	                if (!kv_secret) {
-	                    throw InvalidInputException("Invalid secret format for 'open_prompt' secret");
-	                }
-	                Value secret_value;
-	                if (kv_secret->TryGetValue(secret_key, secret_value)) {
-	                    return secret_value.ToString();
-	                }
-	            }
-	        } catch (...) {
-	            // If secret lookup fails, fall back to user variables
-		    return default_value;
-	        }
-	    }
-    // Fall back to default value
-    return default_value;
-    }
+    static std::string GetConfigValue(ClientContext &context, const string &var_name, const string &default_value)
+    {
+        // Try SET value from current session
+        {
+            Value value;
+            auto &config = ClientConfig::GetConfig(context);
+            if (config.GetUserVariable(var_name, value) && !value.IsNull())
+            {
+                return value.ToString();
+            }
+        }
+        // Try GET environment variables
+        {
+            // Create uppercase ENV version: OPEN_PROMPT_SETTING
+            std::string stripped_name = var_name;
+            const std::string prefix = "openprompt_";
+            if (stripped_name.substr(0, prefix.length()) == prefix)
+            {
+                stripped_name = stripped_name.substr(prefix.length());
+            }
+            std::string env_var_name = "OPEN_PROMPT_" + stripped_name;
+            std::transform(env_var_name.begin(), env_var_name.end(), env_var_name.begin(), ::toupper);
 
-    static void SetConfigValue(DataChunk &args, ExpressionState &state, Vector &result, 
-                              const string &var_name, const string &value_type) {
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(),
-            [&](string_t value) {
-                try {
-                    if (value == "" || value.GetSize() == 0) {
-                        throw std::invalid_argument(value_type + " cannot be empty.");
+            const char *env_value = std::getenv(env_var_name.c_str());
+            if (env_value != nullptr && strlen(env_value) > 0)
+            {
+                std::string result(env_value);
+                return result;
+            }
+        }
+        // Try GET from secrets
+        {
+            // Create lowercase secret version: open_prompt_setting
+            std::string secret_key = var_name;
+            const std::string prefix = "openprompt_";
+            if (secret_key.substr(0, prefix.length()) == prefix)
+            {
+                secret_key = secret_key.substr(prefix.length());
+            }
+            // secret_key = "open_prompt_" + secret_key;
+            std::transform(secret_key.begin(), secret_key.end(), secret_key.begin(), ::tolower);
+
+            auto &secret_manager = SecretManager::Get(context);
+            try
+            {
+                auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+                auto secret_match = secret_manager.LookupSecret(transaction, "open_prompt", "open_prompt");
+                if (secret_match.HasMatch())
+                {
+                    auto &secret = secret_match.GetSecret();
+                    if (secret.GetType() != "open_prompt")
+                    {
+                        throw InvalidInputException("Invalid secret type. Expected 'open_prompt', got '%s'", secret.GetType());
                     }
-                    
-                    ClientConfig::GetConfig(state.GetContext()).SetUserVariable(
-                        var_name,
-                        Value::CreateValue(value.GetString())
-                    );
-                    return StringVector::AddString(result, value_type + " set to: " + value.GetString());
-                } catch (std::exception &e) {
-                    return StringVector::AddString(result, "Failed to set " + value_type + ": " + e.what());
+                    const auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&secret);
+                    if (!kv_secret)
+                    {
+                        throw InvalidInputException("Invalid secret format for 'open_prompt' secret");
+                    }
+                    Value secret_value;
+                    if (kv_secret->TryGetValue(secret_key, secret_value))
+                    {
+                        return secret_value.ToString();
+                    }
                 }
-            });
+            }
+            catch (...)
+            {
+                // If secret lookup fails, fall back to user variables
+                return default_value;
+            }
+        }
+        // Fall back to default value
+        return default_value;
     }
 
-    static void SetApiToken(DataChunk &args, ExpressionState &state, Vector &result) {
+    static void SetConfigValue(DataChunk &args, ExpressionState &state, Vector &result,
+                               const string &var_name, const string &value_type)
+    {
+        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(),
+                                                   [&](string_t value)
+                                                   {
+                                                       try
+                                                       {
+                                                           if (value == "" || value.GetSize() == 0)
+                                                           {
+                                                               throw std::invalid_argument(value_type + " cannot be empty.");
+                                                           }
+
+                                                           ClientConfig::GetConfig(state.GetContext()).SetUserVariable(var_name, Value::CreateValue(value.GetString()));
+                                                           return StringVector::AddString(result, value_type + " set to: " + value.GetString());
+                                                       }
+                                                       catch (std::exception &e)
+                                                       {
+                                                           return StringVector::AddString(result, "Failed to set " + value_type + ": " + e.what());
+                                                       }
+                                                   });
+    }
+
+    static void SetApiToken(DataChunk &args, ExpressionState &state, Vector &result)
+    {
         SetConfigValue(args, state, result, "openprompt_api_token", "API token");
     }
 
-    static void SetApiUrl(DataChunk &args, ExpressionState &state, Vector &result) {
+    static void SetApiUrl(DataChunk &args, ExpressionState &state, Vector &result)
+    {
         SetConfigValue(args, state, result, "openprompt_api_url", "API URL");
     }
 
-    static void SetApiTimeout(DataChunk &args, ExpressionState &state, Vector &result) {
+    static void SetApiTimeout(DataChunk &args, ExpressionState &state, Vector &result)
+    {
         SetConfigValue(args, state, result, "openprompt_api_timeout", "API timeout");
     }
 
-    static void SetModelName(DataChunk &args, ExpressionState &state, Vector &result) {
+    static void SetModelName(DataChunk &args, ExpressionState &state, Vector &result)
+    {
         SetConfigValue(args, state, result, "openprompt_model_name", "Model name");
     }
 
     // Complete OpenPromptRequestFunction
-    static void OpenPromptRequestFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    static void OpenPromptRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
+    {
         D_ASSERT(args.data.size() >= 1); // At least prompt required
 
         UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(),
-            [&](string_t user_prompt) {
-                auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-                auto &info = func_expr.bind_info->Cast<OpenPromptData>();
-                auto &context = state.GetContext();
+                                                   [&](string_t user_prompt)
+                                                   {
+                                                       auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+                                                       auto &info = func_expr.bind_info->Cast<OpenPromptData>();
+                                                       auto &context = state.GetContext();
 
-                std::string api_url = GetConfigValue(context, "openprompt_api_url", 
-                                                   "http://localhost:11434/v1/chat/completions");
-                std::string api_token = GetConfigValue(context, "openprompt_api_token", "");
-                std::string model_name = GetConfigValue(context, "openprompt_model_name", "qwen2.5:0.5b");
-                std::string api_timeout = GetConfigValue(context, "openprompt_api_timeout", "");
-                std::string json_schema;
-                std::string system_prompt;
+                                                       std::string api_url = GetConfigValue(context, "openprompt_api_url",
+                                                                                            "http://localhost:11434/v1/chat/completions");
+                                                       std::string api_token = GetConfigValue(context, "openprompt_api_token", "");
+                                                       std::string model_name = GetConfigValue(context, "openprompt_model_name", "qwen2.5:0.5b");
+                                                       std::string api_timeout = GetConfigValue(context, "openprompt_api_timeout", "");
+                                                       std::string json_schema;
+                                                       std::string system_prompt;
 
-                if (info.model_idx != 0) {
-                    model_name = args.data[info.model_idx].GetValue(0).ToString();
-                }
-                if (info.json_schema_idx != 0) {
-                    json_schema = args.data[info.json_schema_idx].GetValue(0).ToString();
-                }
-                if (info.json_system_prompt_idx != 0) {
-                    system_prompt = args.data[info.json_system_prompt_idx].GetValue(0).ToString();
-                }
+                                                       if (info.model_idx != 0)
+                                                       {
+                                                           model_name = args.data[info.model_idx].GetValue(0).ToString();
+                                                       }
+                                                       if (info.json_schema_idx != 0)
+                                                       {
+                                                           json_schema = args.data[info.json_schema_idx].GetValue(0).ToString();
+                                                       }
+                                                       if (info.json_system_prompt_idx != 0)
+                                                       {
+                                                           system_prompt = args.data[info.json_system_prompt_idx].GetValue(0).ToString();
+                                                       }
 
-                unique_ptr<duckdb_yyjson::yyjson_mut_doc, void (*)(duckdb_yyjson::yyjson_mut_doc*)> doc(
-                        duckdb_yyjson::yyjson_mut_doc_new(nullptr), &duckdb_yyjson::yyjson_mut_doc_free);
-                auto obj = duckdb_yyjson::yyjson_mut_obj(doc.get());
-                duckdb_yyjson::yyjson_mut_doc_set_root(doc.get(), obj);
-                duckdb_yyjson::yyjson_mut_obj_add(obj,
-                    duckdb_yyjson::yyjson_mut_str(doc.get(), "model"),
-                    duckdb_yyjson::yyjson_mut_str(doc.get(), model_name.c_str())
-                    );
-                if (!json_schema.empty()) {
-                    auto response_format = duckdb_yyjson::yyjson_mut_obj(doc.get());
-                    duckdb_yyjson::yyjson_mut_obj_add(response_format,
-                        duckdb_yyjson::yyjson_mut_str(doc.get(), "type"),
-                        duckdb_yyjson::yyjson_mut_str(doc.get(), "json_object"));
-                    auto yyschema = duckdb_yyjson::yyjson_mut_raw(doc.get(), json_schema.c_str());
-                    duckdb_yyjson::yyjson_mut_obj_add(response_format,
-                        duckdb_yyjson::yyjson_mut_str(doc.get(), "schema"),
-                        yyschema);
-                    duckdb_yyjson::yyjson_mut_obj_add(obj,
-                        duckdb_yyjson::yyjson_mut_str(doc.get(),"response_format"),
-                        response_format);
-                }
-                auto messages = duckdb_yyjson::yyjson_mut_arr(doc.get());
-                string str_messages[2][2] = {
-                    {"system", system_prompt},
-                    {"user", user_prompt.GetString()}
-                };
-                for (auto message : str_messages) {
-                    if (message[1].empty()) {
-                        continue;
-                    }
-                    auto yymessage = duckdb_yyjson::yyjson_mut_arr_add_obj(doc.get(),messages);
-                    duckdb_yyjson::yyjson_mut_obj_add(yymessage,
-                        duckdb_yyjson::yyjson_mut_str(doc.get(), "role"),
-                        duckdb_yyjson::yyjson_mut_str(doc.get(), message[0].c_str()));
-                    duckdb_yyjson::yyjson_mut_obj_add(yymessage,
-                        duckdb_yyjson::yyjson_mut_str(doc.get(), "content"),
-                        duckdb_yyjson::yyjson_mut_str(doc.get(), message[1].c_str()));
-                }
-                duckdb_yyjson::yyjson_mut_obj_add(obj, duckdb_yyjson::yyjson_mut_str(doc.get(), "messages"),
-                    messages);
-                duckdb_yyjson::yyjson_write_err err;
-                auto request_body = duckdb_yyjson::yyjson_mut_write_opts(doc.get(), 0, nullptr, nullptr, &err);
-                if (request_body == nullptr) {
-                    throw std::runtime_error(err.msg);
-                }
-                string str_request_body(request_body);
-                free(request_body);
+                                                       unique_ptr<duckdb_yyjson::yyjson_mut_doc, void (*)(duckdb_yyjson::yyjson_mut_doc *)> doc(
+                                                           duckdb_yyjson::yyjson_mut_doc_new(nullptr), &duckdb_yyjson::yyjson_mut_doc_free);
+                                                       auto obj = duckdb_yyjson::yyjson_mut_obj(doc.get());
+                                                       duckdb_yyjson::yyjson_mut_doc_set_root(doc.get(), obj);
+                                                       duckdb_yyjson::yyjson_mut_obj_add(obj,
+                                                                                         duckdb_yyjson::yyjson_mut_str(doc.get(), "model"),
+                                                                                         duckdb_yyjson::yyjson_mut_str(doc.get(), model_name.c_str()));
+                                                       if (!json_schema.empty())
+                                                       {
+                                                           auto response_format = duckdb_yyjson::yyjson_mut_obj(doc.get());
+                                                           duckdb_yyjson::yyjson_mut_obj_add(response_format,
+                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "type"),
+                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "json_object"));
+                                                           auto yyschema = duckdb_yyjson::yyjson_mut_raw(doc.get(), json_schema.c_str());
+                                                           duckdb_yyjson::yyjson_mut_obj_add(response_format,
+                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "schema"),
+                                                                                             yyschema);
+                                                           duckdb_yyjson::yyjson_mut_obj_add(obj,
+                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "response_format"),
+                                                                                             response_format);
+                                                       }
+                                                       auto messages = duckdb_yyjson::yyjson_mut_arr(doc.get());
+                                                       string str_messages[2][2] = {
+                                                           {"system", system_prompt},
+                                                           {"user", user_prompt.GetString()}};
+                                                       for (auto message : str_messages)
+                                                       {
+                                                           if (message[1].empty())
+                                                           {
+                                                               continue;
+                                                           }
+                                                           auto yymessage = duckdb_yyjson::yyjson_mut_arr_add_obj(doc.get(), messages);
+                                                           duckdb_yyjson::yyjson_mut_obj_add(yymessage,
+                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "role"),
+                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), message[0].c_str()));
+                                                           duckdb_yyjson::yyjson_mut_obj_add(yymessage,
+                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "content"),
+                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), message[1].c_str()));
+                                                       }
+                                                       duckdb_yyjson::yyjson_mut_obj_add(obj, duckdb_yyjson::yyjson_mut_str(doc.get(), "messages"),
+                                                                                         messages);
+                                                       duckdb_yyjson::yyjson_write_err err;
+                                                       auto request_body = duckdb_yyjson::yyjson_mut_write_opts(doc.get(), 0, nullptr, nullptr, &err);
+                                                       if (request_body == nullptr)
+                                                       {
+                                                           throw std::runtime_error(err.msg);
+                                                       }
+                                                       string str_request_body(request_body);
+                                                       free(request_body);
 
-                try {
-                    auto client_and_path = SetupHttpClient(api_url);
-                    auto &client = client_and_path.first;
-                    auto &path = client_and_path.second;
+                                                       try
+                                                       {
+                                                           auto client_and_path = SetupHttpClient(api_url);
+                                                           auto &client = client_and_path.first;
+                                                           auto &path = client_and_path.second;
 
-                    duckdb_httplib_openssl::Headers headers;
-                    headers.emplace("Content-Type", "application/json");
-                    if (!api_token.empty()) {
-                        headers.emplace("Authorization", "Bearer " + api_token);
-                    }
+                                                           duckdb_httplib_openssl::Headers headers;
+                                                           headers.emplace("Content-Type", "application/json");
+                                                           if (!api_token.empty())
+                                                           {
+                                                               headers.emplace("Authorization", "Bearer " + api_token);
+                                                           }
 
-                    if (!api_timeout.empty()) {
-                        client.set_read_timeout(stoi(api_timeout), 0);
-                    }
+                                                           if (!api_timeout.empty())
+                                                           {
+                                                               client.set_read_timeout(stoi(api_timeout), 0);
+                                                           }
 
-                    auto res = client.Post(path.c_str(), headers, str_request_body, "application/json");
+                                                           auto res = client.Post(path.c_str(), headers, str_request_body, "application/json");
 
-                    if (!res) {
-                        HandleHttpError(res, "POST");
-                    }
+                                                           if (!res)
+                                                           {
+                                                               HandleHttpError(res, "POST");
+                                                           }
 
-                    if (res->status != 200) {
-                        throw std::runtime_error("HTTP error " + std::to_string(res->status) + ": " + res->reason);
-                    }
+                                                           if (res->status != 200)
+                                                           {
+                                                               throw std::runtime_error("HTTP error " + std::to_string(res->status) + ": " + res->reason);
+                                                           }
 
-                    try {
-                        unique_ptr<duckdb_yyjson::yyjson_doc, void(*)(duckdb_yyjson::yyjson_doc *)> doc(
-                            duckdb_yyjson::yyjson_read(res->body.c_str(), res->body.length(), 0),
-                            &duckdb_yyjson::yyjson_doc_free
-                        );
+                                                           try
+                                                           {
+                                                               unique_ptr<duckdb_yyjson::yyjson_doc, void (*)(duckdb_yyjson::yyjson_doc *)> doc(
+                                                                   duckdb_yyjson::yyjson_read(res->body.c_str(), res->body.length(), 0),
+                                                                   &duckdb_yyjson::yyjson_doc_free);
 
-                        if (!doc) {
-                            throw std::runtime_error("Failed to parse JSON response");
-                        }
+                                                               if (!doc)
+                                                               {
+                                                                   throw std::runtime_error("Failed to parse JSON response");
+                                                               }
 
-                        auto root = duckdb_yyjson::yyjson_doc_get_root(doc.get());
-                        if (!root) {
-                            throw std::runtime_error("Invalid JSON response: no root object");
-                        }
+                                                               auto root = duckdb_yyjson::yyjson_doc_get_root(doc.get());
+                                                               if (!root)
+                                                               {
+                                                                   throw std::runtime_error("Invalid JSON response: no root object");
+                                                               }
 
-                        auto choices = duckdb_yyjson::yyjson_obj_get(root, "choices");
-                        if (!choices || !duckdb_yyjson::yyjson_is_arr(choices)) {
-                            throw std::runtime_error("Invalid response format: missing choices array");
-                        }
+                                                               auto choices = duckdb_yyjson::yyjson_obj_get(root, "choices");
+                                                               if (!choices || !duckdb_yyjson::yyjson_is_arr(choices))
+                                                               {
+                                                                   throw std::runtime_error("Invalid response format: missing choices array");
+                                                               }
 
-                        auto first_choice = duckdb_yyjson::yyjson_arr_get_first(choices);
-                        if (!first_choice) {
-                            throw std::runtime_error("Empty choices array in response");
-                        }
+                                                               auto first_choice = duckdb_yyjson::yyjson_arr_get_first(choices);
+                                                               if (!first_choice)
+                                                               {
+                                                                   throw std::runtime_error("Empty choices array in response");
+                                                               }
 
-                        auto message = duckdb_yyjson::yyjson_obj_get(first_choice, "message");
-                        if (!message) {
-                            throw std::runtime_error("Missing message in response");
-                        }
+                                                               auto message = duckdb_yyjson::yyjson_obj_get(first_choice, "message");
+                                                               if (!message)
+                                                               {
+                                                                   throw std::runtime_error("Missing message in response");
+                                                               }
 
-                        auto content = duckdb_yyjson::yyjson_obj_get(message, "content");
-                        if (!content) {
-                            throw std::runtime_error("Missing content in response");
-                        }
+                                                               auto content = duckdb_yyjson::yyjson_obj_get(message, "content");
+                                                               if (!content)
+                                                               {
+                                                                   throw std::runtime_error("Missing content in response");
+                                                               }
 
-                        auto content_str = duckdb_yyjson::yyjson_get_str(content);
-                        if (!content_str) {
-                            throw std::runtime_error("Invalid content in response");
-                        }
+                                                               auto content_str = duckdb_yyjson::yyjson_get_str(content);
+                                                               if (!content_str)
+                                                               {
+                                                                   throw std::runtime_error("Invalid content in response");
+                                                               }
 
-                        return StringVector::AddString(result, content_str);
-                    } catch (std::exception &e) {
-                        throw std::runtime_error("Failed to parse response: " + std::string(e.what()));
-                    }
-                } catch (std::exception &e) {
-                    return StringVector::AddString(result, "Error: " + std::string(e.what()));
-                }
-            });
+                                                               return StringVector::AddString(result, content_str);
+                                                           }
+                                                           catch (std::exception &e)
+                                                           {
+                                                               throw std::runtime_error("Failed to parse response: " + std::string(e.what()));
+                                                           }
+                                                       }
+                                                       catch (std::exception &e)
+                                                       {
+                                                           return StringVector::AddString(result, "Error: " + std::string(e.what()));
+                                                       }
+                                                   });
     }
 
-    static void LoadInternal(ExtensionLoader &loader) {
+    static void LoadInternal(ExtensionLoader &loader)
+    {
         // Create open_prompt function set
         ScalarFunctionSet open_prompt_set("open_prompt");
 
@@ -509,32 +575,39 @@ namespace duckdb {
         set_timeout_desc.categories = {"ai", "configuration"};
         set_timeout_info.descriptions.push_back(set_timeout_desc);
         loader.RegisterFunction(set_timeout_info);
+
+        QueryFarmSendTelemetry(loader, "open_prompt", "2025120401");
     }
 
-    void OpenPromptExtension::Load(ExtensionLoader &loader) {
+    void OpenPromptExtension::Load(ExtensionLoader &loader)
+    {
         LoadInternal(loader);
     }
 
-    std::string OpenPromptExtension::Name() {
+    std::string OpenPromptExtension::Name()
+    {
         return "open_prompt";
     }
 
-    std::string OpenPromptExtension::Version() const {
-    #ifdef EXT_VERSION_OPENPROMPT
+    std::string OpenPromptExtension::Version() const
+    {
+#ifdef EXT_VERSION_OPENPROMPT
         return EXT_VERSION_OPENPROMPT;
-    #else
+#else
         return "";
-    #endif
+#endif
     }
 
 } // namespace duckdb
 
-extern "C" {
-DUCKDB_CPP_EXTENSION_ENTRY(open_prompt, loader) {
-    duckdb::LoadInternal(loader);
-}
+extern "C"
+{
+    DUCKDB_CPP_EXTENSION_ENTRY(open_prompt, loader)
+    {
+        duckdb::LoadInternal(loader);
+    }
 }
 
 #ifndef DUCKDB_EXTENSION_MAIN
-    #error DUCKDB_EXTENSION_MAIN not defined
+#error DUCKDB_EXTENSION_MAIN not defined
 #endif
