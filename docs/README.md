@@ -88,7 +88,7 @@ SET VARIABLE openprompt_api_url = 'http://localhost:11434/v1/chat/completions';
 SET VARIABLE openprompt_api_token = 'your_api_key_here';
 SET VARIABLE openprompt_model_name = 'qwen2.5:1.5b';
 SELECT open_prompt('I want ice cream.',
-       system_prompt:='The respose MUST be a JSON with the following schema: {
+       system_prompt:='The response MUST be a JSON with the following schema: {
            "type": "object",
            "properties": {
              "summary": { "type": "string" },
