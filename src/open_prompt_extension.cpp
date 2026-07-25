@@ -576,7 +576,7 @@ namespace duckdb
         set_timeout_info.descriptions.push_back(set_timeout_desc);
         loader.RegisterFunction(set_timeout_info);
 
-        QueryFarmSendTelemetry(loader, "open_prompt", "2025120401");
+        QueryFarmSendTelemetry(loader, "open_prompt", "2026072501");
     }
 
     void OpenPromptExtension::Load(ExtensionLoader &loader)
