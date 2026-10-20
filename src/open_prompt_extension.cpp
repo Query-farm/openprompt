@@ -36,54 +36,25 @@
 
 namespace duckdb
 {
-    struct OpenPromptData : FunctionData
-    {
-        idx_t model_idx;
-        idx_t json_schema_idx;
-        idx_t json_system_prompt_idx;
-        unique_ptr<FunctionData> Copy() const override
-        {
-            auto res = make_uniq<OpenPromptData>();
-            res->model_idx = model_idx;
-            res->json_schema_idx = json_schema_idx;
-            res->json_system_prompt_idx = json_system_prompt_idx;
-            return unique_ptr<FunctionData>(std::move(res));
-        };
-        bool Equals(const FunctionData &other) const override
-        {
-            return model_idx == other.Cast<OpenPromptData>().model_idx &&
-                   json_schema_idx == other.Cast<OpenPromptData>().json_schema_idx &&
-                   json_system_prompt_idx == other.Cast<OpenPromptData>().json_system_prompt_idx;
-        };
-        OpenPromptData()
-        {
-            model_idx = 0;
-            json_schema_idx = 0;
-            json_system_prompt_idx = 0;
-        }
-    };
+    // The optional arguments of open_prompt(), in the order of its signature. DuckDB 2.0 lays out the arguments in
+    // signature order and fills in the NULL defaults of the ones a call leaves out, so a NULL means "not given".
+    static constexpr idx_t OPEN_PROMPT_MODEL_IDX = 1;
+    static constexpr idx_t OPEN_PROMPT_JSON_SCHEMA_IDX = 2;
+    static constexpr idx_t OPEN_PROMPT_SYSTEM_PROMPT_IDX = 3;
 
-    unique_ptr<FunctionData> OpenPromptBind(ClientContext &context, ScalarFunction &bound_function,
-                                            vector<unique_ptr<Expression>> &arguments)
+    static bool GetOptionalArgument(DataChunk &args, idx_t arg_idx, std::string &result)
     {
-        auto res = make_uniq<OpenPromptData>();
-        for (idx_t i = 1; i < arguments.size(); ++i)
+        if (arg_idx >= args.ColumnCount())
         {
-            const auto &argument = arguments[i];
-            if (i == 1 && argument->alias.empty())
-            {
-                res->model_idx = i;
-            }
-            else if (argument->alias == "json_schema")
-            {
-                res->json_schema_idx = i;
-            }
-            else if (argument->alias == "system_prompt")
-            {
-                res->json_system_prompt_idx = i;
-            }
+            return false;
         }
-        return std::move(res);
+        auto value = args.data[arg_idx].GetValue(0);
+        if (value.IsNull())
+        {
+            return false;
+        }
+        result = value.ToString();
+        return true;
     }
 
     static std::pair<duckdb_httplib_openssl::Client, std::string> SetupHttpClient(const std::string &url)
@@ -233,7 +204,7 @@ namespace duckdb
                         throw InvalidInputException("Invalid secret format for 'open_prompt' secret");
                     }
                     Value secret_value;
-                    if (kv_secret->TryGetValue(secret_key, secret_value))
+                    if (kv_secret->TryGetValue(Identifier(secret_key), secret_value))
                     {
                         return secret_value.ToString();
                     }
@@ -252,7 +223,7 @@ namespace duckdb
     static void SetConfigValue(DataChunk &args, ExpressionState &state, Vector &result,
                                const string &var_name, const string &value_type)
     {
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(),
+        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result,
                                                    [&](string_t value)
                                                    {
                                                        try
@@ -297,11 +268,9 @@ namespace duckdb
     {
         D_ASSERT(args.data.size() >= 1); // At least prompt required
 
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(),
+        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result,
                                                    [&](string_t user_prompt)
                                                    {
-                                                       auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-                                                       auto &info = func_expr.bind_info->Cast<OpenPromptData>();
                                                        auto &context = state.GetContext();
 
                                                        std::string api_url = GetConfigValue(context, "openprompt_api_url",
@@ -312,18 +281,9 @@ namespace duckdb
                                                        std::string json_schema;
                                                        std::string system_prompt;
 
-                                                       if (info.model_idx != 0)
-                                                       {
-                                                           model_name = args.data[info.model_idx].GetValue(0).ToString();
-                                                       }
-                                                       if (info.json_schema_idx != 0)
-                                                       {
-                                                           json_schema = args.data[info.json_schema_idx].GetValue(0).ToString();
-                                                       }
-                                                       if (info.json_system_prompt_idx != 0)
-                                                       {
-                                                           system_prompt = args.data[info.json_system_prompt_idx].GetValue(0).ToString();
-                                                       }
+                                                       GetOptionalArgument(args, OPEN_PROMPT_MODEL_IDX, model_name);
+                                                       GetOptionalArgument(args, OPEN_PROMPT_JSON_SCHEMA_IDX, json_schema);
+                                                       GetOptionalArgument(args, OPEN_PROMPT_SYSTEM_PROMPT_IDX, system_prompt);
 
                                                        unique_ptr<duckdb_yyjson::yyjson_mut_doc, void (*)(duckdb_yyjson::yyjson_mut_doc *)> doc(
                                                            duckdb_yyjson::yyjson_mut_doc_new(nullptr), &duckdb_yyjson::yyjson_mut_doc_free);
@@ -468,63 +428,35 @@ namespace duckdb
 
     static void LoadInternal(ExtensionLoader &loader)
     {
-        // Create open_prompt function set
+        // open_prompt(prompt, model, json_schema, system_prompt): every argument but the prompt is optional and can be
+        // passed by position or by name (e.g. json_schema := '...'), a NULL default meaning "not given".
+        ScalarFunction open_prompt_fun("open_prompt", {}, LogicalType::VARCHAR, OpenPromptRequestFunction);
+        open_prompt_fun.GetSignature()
+            .AddParameter("prompt", LogicalType::VARCHAR)
+            .AddParameter("model", LogicalType::VARCHAR, Value(LogicalType::VARCHAR))
+            .AddParameter("json_schema", LogicalType::VARCHAR, Value(LogicalType::VARCHAR))
+            .AddParameter("system_prompt", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+        // The NULL defaults must reach the function: a NULL prompt still gives NULL (via the executor)
+        open_prompt_fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+        open_prompt_fun.SetFallible();
         ScalarFunctionSet open_prompt_set("open_prompt");
-
-        // Single argument: prompt only
-        open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR,
-                                                   OpenPromptRequestFunction, OpenPromptBind));
-
-        // Two arguments: prompt + model
-        open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                                   LogicalType::VARCHAR, OpenPromptRequestFunction, OpenPromptBind));
-
-        // Three arguments: prompt + model + json_schema
-        open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                                   LogicalType::VARCHAR, OpenPromptRequestFunction, OpenPromptBind));
-
-        // Four arguments: prompt + model + json_schema + system_prompt
-        open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                                   LogicalType::VARCHAR, OpenPromptRequestFunction, OpenPromptBind));
+        open_prompt_set.AddFunction(open_prompt_fun);
 
         // Create function info with documentation
         CreateScalarFunctionInfo open_prompt_info(open_prompt_set);
 
-        // Document single argument variant
-        FunctionDescription desc1;
-        desc1.parameter_names = {"prompt"};
-        desc1.parameter_types = {LogicalType::VARCHAR};
-        desc1.description = "Send a prompt to an OpenAI-compatible LLM API and return the response";
-        desc1.examples = {"open_prompt('What is DuckDB?')"};
-        desc1.categories = {"ai"};
-        open_prompt_info.descriptions.push_back(desc1);
-
-        // Document two argument variant
-        FunctionDescription desc2;
-        desc2.parameter_names = {"prompt", "model"};
-        desc2.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
-        desc2.description = "Send a prompt to an LLM API using a specific model";
-        desc2.examples = {"open_prompt('Explain SQL', 'gpt-4')"};
-        desc2.categories = {"ai"};
-        open_prompt_info.descriptions.push_back(desc2);
-
-        // Document three argument variant
-        FunctionDescription desc3;
-        desc3.parameter_names = {"prompt", "model", "json_schema"};
-        desc3.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
-        desc3.description = "Send a prompt to an LLM API with structured JSON output";
-        desc3.examples = {"open_prompt('Extract name', 'gpt-4', '{\"type\":\"object\"}')"};
-        desc3.categories = {"ai"};
-        open_prompt_info.descriptions.push_back(desc3);
-
-        // Document four argument variant
-        FunctionDescription desc4;
-        desc4.parameter_names = {"prompt", "model", "json_schema", "system_prompt"};
-        desc4.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
-        desc4.description = "Send a prompt to an LLM API with a system prompt and structured output";
-        desc4.examples = {"open_prompt('Hello', 'gpt-4', '{}', 'You are helpful')"};
-        desc4.categories = {"ai"};
-        open_prompt_info.descriptions.push_back(desc4);
+        FunctionDescription desc;
+        desc.parameter_names = {"prompt", "model", "json_schema", "system_prompt"};
+        desc.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+        desc.description = "Send a prompt to an OpenAI-compatible LLM API and return the response. The model, a JSON "
+                           "schema for structured output and a system prompt are optional and can be passed by "
+                           "position or by name";
+        desc.examples = {"open_prompt('What is DuckDB?')", "open_prompt('Explain SQL', 'gpt-4')",
+                         "open_prompt('Extract name', 'gpt-4', '{\"type\":\"object\"}')",
+                         "open_prompt('Hello', 'gpt-4', '{}', 'You are helpful')",
+                         "open_prompt('I want ice cream', json_schema := '{\"type\":\"object\"}')"};
+        desc.categories = {"ai"};
+        open_prompt_info.descriptions.push_back(desc);
 
         loader.RegisterFunction(open_prompt_info);
 
