@@ -1,545 +1,172 @@
 #define DUCKDB_EXTENSION_MAIN
+
 #include "open_prompt_extension.hpp"
-#include "duckdb.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/common/atomic.hpp"
-#include "duckdb/common/exception/http_exception.hpp"
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/extension_load_options.hpp"
+#include "duckdb/main/extension_repository_manager.hpp"
 
-#include "duckdb/main/secret/secret_manager.hpp"
-#include "duckdb/main/secret/secret.hpp"
-#include "duckdb/main/secret/secret_storage.hpp"
+// For DuckDB 2.0 and later this extension is distributed from the Query.Farm extension repository. The build published to the
+// DuckDB community repository only keeps the name. When the user has already added the Query.Farm repository and
+// installed the extension from it, loading this build loads that one; otherwise it explains the remaining steps.
+// It never adds the repository or installs anything itself: trusting a repository is the user's decision.
 
-#include "open_prompt_secret.hpp"
-#include "query_farm_telemetry.hpp"
+namespace duckdb {
 
-#ifdef USE_ZLIB
-#define CPPHTTPLIB_ZLIB_SUPPORT
-#endif
+static constexpr const char *EXTENSION_NAME = "open_prompt";
+static constexpr const char *EXTENSION_VERSION = "2026102001";
+static constexpr const char *REPOSITORY_NAME = "query_farm";
+static constexpr const char *REPOSITORY_URL = "https://duckdb-extensions.query.farm";
+static constexpr const char *REPOSITORY_HTTP_URL = "http://duckdb-extensions.query.farm";
+// sha256 fingerprints of the Query.Farm repository signing keys (primary and standby)
+static constexpr const char *REPOSITORY_KEY_FINGERPRINTS[] = {
+    "sha256:b293ba6145db8f51f301618f59a720cb8c0c21e7efc6119aab43ea5c708947b5",
+    "sha256:6959de1c16b783b14d4c904f69361811f737017d79ea7078729a74ec2f7f7753"};
 
-#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include "httplib.hpp"
+static string MovedPreamble() {
+	return StringUtil::Format("The %s extension for DuckDB 2.0 and later is distributed from the Query.Farm extension repository, "
+	                          "not the DuckDB community repository.\n\n",
+	                          EXTENSION_NAME);
+}
 
-#include <cstdlib>
-#include <algorithm>
-#include <cctype>
-#include <string>
-#include <sstream>
-#include <mutex>
-#include <iostream>
-#include <duckdb/planner/expression/bound_function_expression.hpp>
+static string MoreInformation() {
+	return StringUtil::Format("\n\nMore information: https://query.farm/products/extensions/%s/", EXTENSION_NAME);
+}
 
-#include "yyjson.hpp"
+static bool IsInstalledFromRepository(DatabaseInstance &db, FileSystem &fs) {
+	for (auto &directory : ExtensionHelper::GetExtensionDirectoryPath(db, fs)) {
+		auto path = fs.JoinPath(fs.JoinPath(fs.JoinPath(directory, "repositories"), REPOSITORY_NAME),
+		                        string(EXTENSION_NAME) + ".duckdb_extension");
+		if (fs.FileExists(path)) {
+			return true;
+		}
+	}
+	return false;
+}
 
-#include <stdio.h>
+// A repository named query_farm is only used when it points at the Query.Farm prefix and pins a Query.Farm signing key.
+static bool IsQueryFarmRepository(const ExtensionRepository &repository) {
+	auto prefix = StringUtil::Lower(repository.path);
+	while (StringUtil::EndsWith(prefix, "/")) {
+		prefix.pop_back();
+	}
+	if (prefix != REPOSITORY_URL && prefix != REPOSITORY_HTTP_URL) {
+		return false;
+	}
+	for (auto &key : repository.public_keys) {
+		auto fingerprint = ExtensionRepositoryManager::GetPublicKeyFingerprint(key);
+		for (auto trusted : REPOSITORY_KEY_FINGERPRINTS) {
+			if (fingerprint == trusted) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
 
-namespace duckdb
-{
-    // The optional arguments of open_prompt(), in the order of its signature. DuckDB 2.0 lays out the arguments in
-    // signature order and fills in the NULL defaults of the ones a call leaves out, so a NULL means "not given".
-    static constexpr idx_t OPEN_PROMPT_MODEL_IDX = 1;
-    static constexpr idx_t OPEN_PROMPT_JSON_SCHEMA_IDX = 2;
-    static constexpr idx_t OPEN_PROMPT_SYSTEM_PROMPT_IDX = 3;
+static void LoadFromQueryFarmOrExplain(DatabaseInstance &db) {
+	auto &fs = FileSystem::GetFileSystem(db);
+	ExtensionRepository repository;
+	bool has_repository = ExtensionRepositoryManager::TryGetRepository(db, fs, REPOSITORY_NAME, repository);
 
-    static bool GetOptionalArgument(DataChunk &args, idx_t arg_idx, std::string &result)
-    {
-        if (arg_idx >= args.ColumnCount())
-        {
-            return false;
-        }
-        auto value = args.data[arg_idx].GetValue(0);
-        if (value.IsNull())
-        {
-            return false;
-        }
-        result = value.ToString();
-        return true;
-    }
+	if (!has_repository) {
+		throw MissingExtensionException(
+		    "%sAdd the repository and install the extension once:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    CREATE EXTENSION REPOSITORY IF NOT EXISTS %s WITH PREFIX '%s';\n"
+		    "    INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Then load it in each session with:\n"
+		    "\n"
+		    "    LOAD %s FROM %s;%s",
+		    MovedPreamble(), REPOSITORY_NAME, REPOSITORY_URL, EXTENSION_NAME, REPOSITORY_NAME, EXTENSION_NAME,
+		    REPOSITORY_NAME, MoreInformation());
+	}
+	if (!IsQueryFarmRepository(repository)) {
+		throw MissingExtensionException(
+		    "%sA repository named %s is configured with the prefix '%s', but it is not the Query.Farm extension "
+		    "repository: it points somewhere else or does not use the Query.Farm signing keys, so the extension is not "
+		    "loaded from it. Replace it with the Query.Farm repository and reinstall the extension:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    CREATE OR REPLACE EXTENSION REPOSITORY %s WITH PREFIX '%s';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Then load it in each session with:\n"
+		    "\n"
+		    "    LOAD %s FROM %s;%s",
+		    MovedPreamble(), REPOSITORY_NAME, repository.path, REPOSITORY_NAME, REPOSITORY_URL, EXTENSION_NAME,
+		    REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
+	if (ExtensionRepositoryManager::GetAccess(db) == ExtensionRepositoryAccess::FORBIDDEN) {
+		throw MissingExtensionException("%sThe %s repository is configured, but allow_extension_repositories is set to "
+		                                "'forbidden', so extensions from it cannot be loaded.%s",
+		                                MovedPreamble(), REPOSITORY_NAME, MoreInformation());
+	}
+	if (!IsInstalledFromRepository(db, fs)) {
+		throw MissingExtensionException("%sThe %s repository is already configured. Install the extension from it once:\n"
+		                                "\n"
+		                                "    SET allow_extension_repositories = 'allowed';\n"
+		                                "    INSTALL %s FROM %s;\n"
+		                                "\n"
+		                                "Then load it in each session with:\n"
+		                                "\n"
+		                                "    LOAD %s FROM %s;%s",
+		                                MovedPreamble(), REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME,
+		                                EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
 
-    static std::pair<duckdb_httplib_openssl::Client, std::string> SetupHttpClient(const std::string &url)
-    {
-        std::string scheme, domain, path, client_url;
-        size_t pos = url.find("://");
-        std::string mod_url = url;
-        if (pos != std::string::npos)
-        {
-            scheme = mod_url.substr(0, pos);
-            mod_url.erase(0, pos + 3);
-        }
+	// The repository is trusted and the extension is installed from it: load that build. DuckDB holds the load lock
+	// for this name while this stub initializes, so the real extension is loaded under an alias; its functions are
+	// registered as usual.
+	ExtensionLoadOptions options(EXTENSION_NAME);
+	options.repository = REPOSITORY_NAME;
+	options.alias = Identifier(string(EXTENSION_NAME) + "_" + REPOSITORY_NAME);
+	try {
+		ExtensionHelper::LoadExternalExtension(db, fs, options);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (error.Type() != ExceptionType::IO || !StringUtil::Contains(error.RawMessage(), "signature")) {
+			throw;
+		}
+		throw MissingExtensionException(
+		    "%sThe %s extension installed from the %s repository failed signature verification. The file may be "
+		    "damaged, or it was signed with a key that this repository definition does not trust. Reinstall it:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "If loading still fails the same way, refresh the repository's signing keys and reinstall:\n"
+		    "\n"
+		    "    CREATE OR REPLACE EXTENSION REPOSITORY %s WITH PREFIX '%s';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Do not use -unsigned to work around this.%s",
+		    MovedPreamble(), EXTENSION_NAME, REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME, REPOSITORY_NAME,
+		    REPOSITORY_URL, EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
+}
 
-        pos = mod_url.find("/");
-        if (pos != std::string::npos)
-        {
-            domain = mod_url.substr(0, pos);
-            path = mod_url.substr(pos);
-        }
-        else
-        {
-            domain = mod_url;
-            path = "/";
-        }
+void Open_promptExtension::Load(ExtensionLoader &loader) {
+	LoadFromQueryFarmOrExplain(loader.GetDatabaseInstance());
+}
 
-        // Construct client url with scheme if specified
-        if (scheme.length() > 0)
-        {
-            client_url = scheme + "://" + domain;
-        }
-        else
-        {
-            client_url = domain;
-        }
+std::string Open_promptExtension::Name() {
+	return EXTENSION_NAME;
+}
 
-        duckdb_httplib_openssl::Client client(client_url);
-        client.set_read_timeout(20, 0);   // 20 seconds
-        client.set_follow_location(true); // Follow redirects
-
-        return std::make_pair(std::move(client), path);
-    }
-
-    static void HandleHttpError(const duckdb_httplib_openssl::Result &res, const std::string &request_type)
-    {
-        std::string err_message = "HTTP " + request_type + " request failed. ";
-
-        switch (res.error())
-        {
-        case duckdb_httplib_openssl::Error::Connection:
-            err_message += "Connection error.";
-            break;
-        case duckdb_httplib_openssl::Error::BindIPAddress:
-            err_message += "Failed to bind IP address.";
-            break;
-        case duckdb_httplib_openssl::Error::Read:
-            err_message += "Error reading response.";
-            break;
-        case duckdb_httplib_openssl::Error::Write:
-            err_message += "Error writing request.";
-            break;
-        case duckdb_httplib_openssl::Error::ExceedRedirectCount:
-            err_message += "Too many redirects.";
-            break;
-        case duckdb_httplib_openssl::Error::Canceled:
-            err_message += "Request was canceled.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLConnection:
-            err_message += "SSL connection failed.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLLoadingCerts:
-            err_message += "Failed to load SSL certificates.";
-            break;
-        case duckdb_httplib_openssl::Error::SSLServerVerification:
-            err_message += "SSL server verification failed.";
-            break;
-        case duckdb_httplib_openssl::Error::UnsupportedMultipartBoundaryChars:
-            err_message += "Unsupported characters in multipart boundary.";
-            break;
-        case duckdb_httplib_openssl::Error::Compression:
-            err_message += "Error during compression.";
-            break;
-        default:
-            err_message += "Unknown error.";
-            break;
-        }
-        throw std::runtime_error(err_message);
-    }
-
-    // Settings management
-    static std::string GetConfigValue(ClientContext &context, const string &var_name, const string &default_value)
-    {
-        // Try SET value from current session
-        {
-            Value value;
-            auto &config = ClientConfig::GetConfig(context);
-            if (config.GetUserVariable(var_name, value) && !value.IsNull())
-            {
-                return value.ToString();
-            }
-        }
-        // Try GET environment variables
-        {
-            // Create uppercase ENV version: OPEN_PROMPT_SETTING
-            std::string stripped_name = var_name;
-            const std::string prefix = "openprompt_";
-            if (stripped_name.substr(0, prefix.length()) == prefix)
-            {
-                stripped_name = stripped_name.substr(prefix.length());
-            }
-            std::string env_var_name = "OPEN_PROMPT_" + stripped_name;
-            std::transform(env_var_name.begin(), env_var_name.end(), env_var_name.begin(), ::toupper);
-
-            const char *env_value = std::getenv(env_var_name.c_str());
-            if (env_value != nullptr && strlen(env_value) > 0)
-            {
-                std::string result(env_value);
-                return result;
-            }
-        }
-        // Try GET from secrets
-        {
-            // Create lowercase secret version: open_prompt_setting
-            std::string secret_key = var_name;
-            const std::string prefix = "openprompt_";
-            if (secret_key.substr(0, prefix.length()) == prefix)
-            {
-                secret_key = secret_key.substr(prefix.length());
-            }
-            // secret_key = "open_prompt_" + secret_key;
-            std::transform(secret_key.begin(), secret_key.end(), secret_key.begin(), ::tolower);
-
-            auto &secret_manager = SecretManager::Get(context);
-            try
-            {
-                auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-                auto secret_match = secret_manager.LookupSecret(transaction, "open_prompt", "open_prompt");
-                if (secret_match.HasMatch())
-                {
-                    auto &secret = secret_match.GetSecret();
-                    if (secret.GetType() != "open_prompt")
-                    {
-                        throw InvalidInputException("Invalid secret type. Expected 'open_prompt', got '%s'", secret.GetType());
-                    }
-                    const auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&secret);
-                    if (!kv_secret)
-                    {
-                        throw InvalidInputException("Invalid secret format for 'open_prompt' secret");
-                    }
-                    Value secret_value;
-                    if (kv_secret->TryGetValue(Identifier(secret_key), secret_value))
-                    {
-                        return secret_value.ToString();
-                    }
-                }
-            }
-            catch (...)
-            {
-                // If secret lookup fails, fall back to user variables
-                return default_value;
-            }
-        }
-        // Fall back to default value
-        return default_value;
-    }
-
-    static void SetConfigValue(DataChunk &args, ExpressionState &state, Vector &result,
-                               const string &var_name, const string &value_type)
-    {
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result,
-                                                   [&](string_t value)
-                                                   {
-                                                       try
-                                                       {
-                                                           if (value == "" || value.GetSize() == 0)
-                                                           {
-                                                               throw std::invalid_argument(value_type + " cannot be empty.");
-                                                           }
-
-                                                           ClientConfig::GetConfig(state.GetContext()).SetUserVariable(var_name, Value::CreateValue(value.GetString()));
-                                                           return StringVector::AddString(result, value_type + " set to: " + value.GetString());
-                                                       }
-                                                       catch (std::exception &e)
-                                                       {
-                                                           return StringVector::AddString(result, "Failed to set " + value_type + ": " + e.what());
-                                                       }
-                                                   });
-    }
-
-    static void SetApiToken(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        SetConfigValue(args, state, result, "openprompt_api_token", "API token");
-    }
-
-    static void SetApiUrl(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        SetConfigValue(args, state, result, "openprompt_api_url", "API URL");
-    }
-
-    static void SetApiTimeout(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        SetConfigValue(args, state, result, "openprompt_api_timeout", "API timeout");
-    }
-
-    static void SetModelName(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        SetConfigValue(args, state, result, "openprompt_model_name", "Model name");
-    }
-
-    // Complete OpenPromptRequestFunction
-    static void OpenPromptRequestFunction(DataChunk &args, ExpressionState &state, Vector &result)
-    {
-        D_ASSERT(args.data.size() >= 1); // At least prompt required
-
-        UnaryExecutor::Execute<string_t, string_t>(args.data[0], result,
-                                                   [&](string_t user_prompt)
-                                                   {
-                                                       auto &context = state.GetContext();
-
-                                                       std::string api_url = GetConfigValue(context, "openprompt_api_url",
-                                                                                            "http://localhost:11434/v1/chat/completions");
-                                                       std::string api_token = GetConfigValue(context, "openprompt_api_token", "");
-                                                       std::string model_name = GetConfigValue(context, "openprompt_model_name", "qwen2.5:0.5b");
-                                                       std::string api_timeout = GetConfigValue(context, "openprompt_api_timeout", "");
-                                                       std::string json_schema;
-                                                       std::string system_prompt;
-
-                                                       GetOptionalArgument(args, OPEN_PROMPT_MODEL_IDX, model_name);
-                                                       GetOptionalArgument(args, OPEN_PROMPT_JSON_SCHEMA_IDX, json_schema);
-                                                       GetOptionalArgument(args, OPEN_PROMPT_SYSTEM_PROMPT_IDX, system_prompt);
-
-                                                       unique_ptr<duckdb_yyjson::yyjson_mut_doc, void (*)(duckdb_yyjson::yyjson_mut_doc *)> doc(
-                                                           duckdb_yyjson::yyjson_mut_doc_new(nullptr), &duckdb_yyjson::yyjson_mut_doc_free);
-                                                       auto obj = duckdb_yyjson::yyjson_mut_obj(doc.get());
-                                                       duckdb_yyjson::yyjson_mut_doc_set_root(doc.get(), obj);
-                                                       duckdb_yyjson::yyjson_mut_obj_add(obj,
-                                                                                         duckdb_yyjson::yyjson_mut_str(doc.get(), "model"),
-                                                                                         duckdb_yyjson::yyjson_mut_str(doc.get(), model_name.c_str()));
-                                                       if (!json_schema.empty())
-                                                       {
-                                                           auto response_format = duckdb_yyjson::yyjson_mut_obj(doc.get());
-                                                           duckdb_yyjson::yyjson_mut_obj_add(response_format,
-                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "type"),
-                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "json_object"));
-                                                           auto yyschema = duckdb_yyjson::yyjson_mut_raw(doc.get(), json_schema.c_str());
-                                                           duckdb_yyjson::yyjson_mut_obj_add(response_format,
-                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "schema"),
-                                                                                             yyschema);
-                                                           duckdb_yyjson::yyjson_mut_obj_add(obj,
-                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "response_format"),
-                                                                                             response_format);
-                                                       }
-                                                       auto messages = duckdb_yyjson::yyjson_mut_arr(doc.get());
-                                                       string str_messages[2][2] = {
-                                                           {"system", system_prompt},
-                                                           {"user", user_prompt.GetString()}};
-                                                       for (auto message : str_messages)
-                                                       {
-                                                           if (message[1].empty())
-                                                           {
-                                                               continue;
-                                                           }
-                                                           auto yymessage = duckdb_yyjson::yyjson_mut_arr_add_obj(doc.get(), messages);
-                                                           duckdb_yyjson::yyjson_mut_obj_add(yymessage,
-                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "role"),
-                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), message[0].c_str()));
-                                                           duckdb_yyjson::yyjson_mut_obj_add(yymessage,
-                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), "content"),
-                                                                                             duckdb_yyjson::yyjson_mut_str(doc.get(), message[1].c_str()));
-                                                       }
-                                                       duckdb_yyjson::yyjson_mut_obj_add(obj, duckdb_yyjson::yyjson_mut_str(doc.get(), "messages"),
-                                                                                         messages);
-                                                       duckdb_yyjson::yyjson_write_err err;
-                                                       auto request_body = duckdb_yyjson::yyjson_mut_write_opts(doc.get(), 0, nullptr, nullptr, &err);
-                                                       if (request_body == nullptr)
-                                                       {
-                                                           throw std::runtime_error(err.msg);
-                                                       }
-                                                       string str_request_body(request_body);
-                                                       free(request_body);
-
-                                                       try
-                                                       {
-                                                           auto client_and_path = SetupHttpClient(api_url);
-                                                           auto &client = client_and_path.first;
-                                                           auto &path = client_and_path.second;
-
-                                                           duckdb_httplib_openssl::Headers headers;
-                                                           headers.emplace("Content-Type", "application/json");
-                                                           if (!api_token.empty())
-                                                           {
-                                                               headers.emplace("Authorization", "Bearer " + api_token);
-                                                           }
-
-                                                           if (!api_timeout.empty())
-                                                           {
-                                                               client.set_read_timeout(stoi(api_timeout), 0);
-                                                           }
-
-                                                           auto res = client.Post(path.c_str(), headers, str_request_body, "application/json");
-
-                                                           if (!res)
-                                                           {
-                                                               HandleHttpError(res, "POST");
-                                                           }
-
-                                                           if (res->status != 200)
-                                                           {
-                                                               throw std::runtime_error("HTTP error " + std::to_string(res->status) + ": " + res->reason);
-                                                           }
-
-                                                           try
-                                                           {
-                                                               unique_ptr<duckdb_yyjson::yyjson_doc, void (*)(duckdb_yyjson::yyjson_doc *)> doc(
-                                                                   duckdb_yyjson::yyjson_read(res->body.c_str(), res->body.length(), 0),
-                                                                   &duckdb_yyjson::yyjson_doc_free);
-
-                                                               if (!doc)
-                                                               {
-                                                                   throw std::runtime_error("Failed to parse JSON response");
-                                                               }
-
-                                                               auto root = duckdb_yyjson::yyjson_doc_get_root(doc.get());
-                                                               if (!root)
-                                                               {
-                                                                   throw std::runtime_error("Invalid JSON response: no root object");
-                                                               }
-
-                                                               auto choices = duckdb_yyjson::yyjson_obj_get(root, "choices");
-                                                               if (!choices || !duckdb_yyjson::yyjson_is_arr(choices))
-                                                               {
-                                                                   throw std::runtime_error("Invalid response format: missing choices array");
-                                                               }
-
-                                                               auto first_choice = duckdb_yyjson::yyjson_arr_get_first(choices);
-                                                               if (!first_choice)
-                                                               {
-                                                                   throw std::runtime_error("Empty choices array in response");
-                                                               }
-
-                                                               auto message = duckdb_yyjson::yyjson_obj_get(first_choice, "message");
-                                                               if (!message)
-                                                               {
-                                                                   throw std::runtime_error("Missing message in response");
-                                                               }
-
-                                                               auto content = duckdb_yyjson::yyjson_obj_get(message, "content");
-                                                               if (!content)
-                                                               {
-                                                                   throw std::runtime_error("Missing content in response");
-                                                               }
-
-                                                               auto content_str = duckdb_yyjson::yyjson_get_str(content);
-                                                               if (!content_str)
-                                                               {
-                                                                   throw std::runtime_error("Invalid content in response");
-                                                               }
-
-                                                               return StringVector::AddString(result, content_str);
-                                                           }
-                                                           catch (std::exception &e)
-                                                           {
-                                                               throw std::runtime_error("Failed to parse response: " + std::string(e.what()));
-                                                           }
-                                                       }
-                                                       catch (std::exception &e)
-                                                       {
-                                                           return StringVector::AddString(result, "Error: " + std::string(e.what()));
-                                                       }
-                                                   });
-    }
-
-    static void LoadInternal(ExtensionLoader &loader)
-    {
-        // open_prompt(prompt, model, json_schema, system_prompt): every argument but the prompt is optional and can be
-        // passed by position or by name (e.g. json_schema := '...'), a NULL default meaning "not given".
-        ScalarFunction open_prompt_fun("open_prompt", {}, LogicalType::VARCHAR, OpenPromptRequestFunction);
-        open_prompt_fun.GetSignature()
-            .AddParameter("prompt", LogicalType::VARCHAR)
-            .AddParameter("model", LogicalType::VARCHAR, Value(LogicalType::VARCHAR))
-            .AddParameter("json_schema", LogicalType::VARCHAR, Value(LogicalType::VARCHAR))
-            .AddParameter("system_prompt", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
-        // The NULL defaults must reach the function: a NULL prompt still gives NULL (via the executor)
-        open_prompt_fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-        open_prompt_fun.SetFallible();
-        ScalarFunctionSet open_prompt_set("open_prompt");
-        open_prompt_set.AddFunction(open_prompt_fun);
-
-        // Create function info with documentation
-        CreateScalarFunctionInfo open_prompt_info(open_prompt_set);
-
-        FunctionDescription desc;
-        desc.parameter_names = {"prompt", "model", "json_schema", "system_prompt"};
-        desc.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
-        desc.description = "Send a prompt to an OpenAI-compatible LLM API and return the response. The model, a JSON "
-                           "schema for structured output and a system prompt are optional and can be passed by "
-                           "position or by name";
-        desc.examples = {"open_prompt('What is DuckDB?')", "open_prompt('Explain SQL', 'gpt-4')",
-                         "open_prompt('Extract name', 'gpt-4', '{\"type\":\"object\"}')",
-                         "open_prompt('Hello', 'gpt-4', '{}', 'You are helpful')",
-                         "open_prompt('I want ice cream', json_schema := '{\"type\":\"object\"}')"};
-        desc.categories = {"ai"};
-        open_prompt_info.descriptions.push_back(desc);
-
-        loader.RegisterFunction(open_prompt_info);
-
-        // Register Secret functions
-        CreateOpenPromptSecretFunctions::Register(loader);
-
-        // Configuration helper functions with documentation
-        CreateScalarFunctionInfo set_token_info(ScalarFunction("set_api_token", {LogicalType::VARCHAR},
-                                                               LogicalType::VARCHAR, SetApiToken));
-        FunctionDescription set_token_desc;
-        set_token_desc.parameter_names = {"token"};
-        set_token_desc.parameter_types = {LogicalType::VARCHAR};
-        set_token_desc.description = "Set the API token for LLM authentication";
-        set_token_desc.examples = {"set_api_token('sk-...')"};
-        set_token_desc.categories = {"ai", "configuration"};
-        set_token_info.descriptions.push_back(set_token_desc);
-        loader.RegisterFunction(set_token_info);
-
-        CreateScalarFunctionInfo set_url_info(ScalarFunction("set_api_url", {LogicalType::VARCHAR},
-                                                             LogicalType::VARCHAR, SetApiUrl));
-        FunctionDescription set_url_desc;
-        set_url_desc.parameter_names = {"url"};
-        set_url_desc.parameter_types = {LogicalType::VARCHAR};
-        set_url_desc.description = "Set the API URL for LLM endpoint";
-        set_url_desc.examples = {"set_api_url('https://api.openai.com/v1/chat/completions')"};
-        set_url_desc.categories = {"ai", "configuration"};
-        set_url_info.descriptions.push_back(set_url_desc);
-        loader.RegisterFunction(set_url_info);
-
-        CreateScalarFunctionInfo set_model_info(ScalarFunction("set_model_name", {LogicalType::VARCHAR},
-                                                               LogicalType::VARCHAR, SetModelName));
-        FunctionDescription set_model_desc;
-        set_model_desc.parameter_names = {"model"};
-        set_model_desc.parameter_types = {LogicalType::VARCHAR};
-        set_model_desc.description = "Set the default model name for LLM requests";
-        set_model_desc.examples = {"set_model_name('gpt-4')"};
-        set_model_desc.categories = {"ai", "configuration"};
-        set_model_info.descriptions.push_back(set_model_desc);
-        loader.RegisterFunction(set_model_info);
-
-        CreateScalarFunctionInfo set_timeout_info(ScalarFunction("set_api_timeout", {LogicalType::VARCHAR},
-                                                                 LogicalType::VARCHAR, SetApiTimeout));
-        FunctionDescription set_timeout_desc;
-        set_timeout_desc.parameter_names = {"timeout_seconds"};
-        set_timeout_desc.parameter_types = {LogicalType::VARCHAR};
-        set_timeout_desc.description = "Set the API timeout in seconds for LLM requests";
-        set_timeout_desc.examples = {"set_api_timeout('30')"};
-        set_timeout_desc.categories = {"ai", "configuration"};
-        set_timeout_info.descriptions.push_back(set_timeout_desc);
-        loader.RegisterFunction(set_timeout_info);
-
-        QueryFarmSendTelemetry(loader, "open_prompt", "2026102002");
-    }
-
-    void OpenPromptExtension::Load(ExtensionLoader &loader)
-    {
-        LoadInternal(loader);
-    }
-
-    std::string OpenPromptExtension::Name()
-    {
-        return "open_prompt";
-    }
-
-    std::string OpenPromptExtension::Version() const
-    {
-#ifdef EXT_VERSION_OPENPROMPT
-        return EXT_VERSION_OPENPROMPT;
-#else
-        return "";
-#endif
-    }
+std::string Open_promptExtension::Version() const {
+	return EXTENSION_VERSION;
+}
 
 } // namespace duckdb
 
-extern "C"
-{
-    DUCKDB_CPP_EXTENSION_ENTRY(open_prompt, loader)
-    {
-        duckdb::LoadInternal(loader);
-    }
-}
+extern "C" {
 
-#ifndef DUCKDB_EXTENSION_MAIN
-#error DUCKDB_EXTENSION_MAIN not defined
-#endif
+DUCKDB_CPP_EXTENSION_ENTRY(open_prompt, loader) {
+	duckdb::LoadFromQueryFarmOrExplain(loader.GetDatabaseInstance());
+}
+}

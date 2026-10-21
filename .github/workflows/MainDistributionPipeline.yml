@@ -2,10 +2,7 @@ name: Main Extension Distribution Pipeline
 on:
   push:
     branches:
-    - v2.0
-    paths-ignore:
-    - '**/*.md'
-    - '**/*.yml'
+    - v2.0-community-stub
   pull_request: null
   workflow_dispatch: null
 concurrency:
