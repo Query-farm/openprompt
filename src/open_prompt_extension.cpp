@@ -36,6 +36,11 @@
 
 namespace duckdb
 {
+
+//! A positional-only parameter with a real name (bare types would be reported as col0, col1, ...)
+static FunctionParameter Positional(const char *name, LogicalType type) {
+	return FunctionParameter(name, std::move(type), {}, FunctionParameterKind::POSITIONAL_ONLY);
+}
     // The optional arguments of open_prompt(), in the order of its signature. DuckDB 2.0 lays out the arguments in
     // signature order and fills in the NULL defaults of the ones a call leaves out, so a NULL means "not given".
     static constexpr idx_t OPEN_PROMPT_MODEL_IDX = 1;
@@ -464,7 +469,8 @@ namespace duckdb
         CreateOpenPromptSecretFunctions::Register(loader);
 
         // Configuration helper functions with documentation
-        CreateScalarFunctionInfo set_token_info(ScalarFunction("set_api_token", {LogicalType::VARCHAR},
+        CreateScalarFunctionInfo set_token_info(ScalarFunction("set_api_token",
+                                                               {Positional("token", LogicalType::VARCHAR)},
                                                                LogicalType::VARCHAR, SetApiToken));
         FunctionDescription set_token_desc;
         set_token_desc.parameter_names = {"token"};
@@ -475,7 +481,7 @@ namespace duckdb
         set_token_info.descriptions.push_back(set_token_desc);
         loader.RegisterFunction(set_token_info);
 
-        CreateScalarFunctionInfo set_url_info(ScalarFunction("set_api_url", {LogicalType::VARCHAR},
+        CreateScalarFunctionInfo set_url_info(ScalarFunction("set_api_url", {Positional("url", LogicalType::VARCHAR)},
                                                              LogicalType::VARCHAR, SetApiUrl));
         FunctionDescription set_url_desc;
         set_url_desc.parameter_names = {"url"};
@@ -486,7 +492,8 @@ namespace duckdb
         set_url_info.descriptions.push_back(set_url_desc);
         loader.RegisterFunction(set_url_info);
 
-        CreateScalarFunctionInfo set_model_info(ScalarFunction("set_model_name", {LogicalType::VARCHAR},
+        CreateScalarFunctionInfo set_model_info(ScalarFunction("set_model_name",
+                                                               {Positional("model", LogicalType::VARCHAR)},
                                                                LogicalType::VARCHAR, SetModelName));
         FunctionDescription set_model_desc;
         set_model_desc.parameter_names = {"model"};
@@ -497,7 +504,8 @@ namespace duckdb
         set_model_info.descriptions.push_back(set_model_desc);
         loader.RegisterFunction(set_model_info);
 
-        CreateScalarFunctionInfo set_timeout_info(ScalarFunction("set_api_timeout", {LogicalType::VARCHAR},
+        CreateScalarFunctionInfo set_timeout_info(ScalarFunction("set_api_timeout",
+                                                                 {Positional("timeout_seconds", LogicalType::VARCHAR)},
                                                                  LogicalType::VARCHAR, SetApiTimeout));
         FunctionDescription set_timeout_desc;
         set_timeout_desc.parameter_names = {"timeout_seconds"};
@@ -508,7 +516,7 @@ namespace duckdb
         set_timeout_info.descriptions.push_back(set_timeout_desc);
         loader.RegisterFunction(set_timeout_info);
 
-        QueryFarmSendTelemetry(loader, "open_prompt", "2026102002");
+        QueryFarmSendTelemetry(loader, "open_prompt", "2026102101");
     }
 
     void OpenPromptExtension::Load(ExtensionLoader &loader)

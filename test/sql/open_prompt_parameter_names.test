@@ -1,0 +1,34 @@
+# name: test/sql/open_prompt_parameter_names.test
+# description: every function parameter is reported with a real name, not col0, col1, ...
+# group: [sql]
+
+require open_prompt
+
+query IIT
+SELECT function_name, function_type, parameters FROM duckdb_functions()
+WHERE extension_name = 'open_prompt' AND function_type = 'scalar'
+ORDER BY function_name, function_type, len(parameters), parameter_types::VARCHAR;
+----
+open_prompt	scalar	[prompt, model, json_schema, system_prompt]
+set_api_timeout	scalar	[timeout_seconds]
+set_api_token	scalar	[token]
+set_api_url	scalar	[url]
+set_model_name	scalar	[model]
+
+# No parameter may fall back to a positional colN name
+query I
+SELECT count(*) FROM (SELECT unnest(parameters) AS p FROM duckdb_functions() WHERE extension_name = 'open_prompt')
+WHERE regexp_matches(p, '^col[0-9]+$');
+----
+0
+
+# Positional calls work as before
+query T
+SELECT set_api_timeout('30');
+----
+API timeout set to: 30
+
+query T
+SELECT set_model_name('llama-3.3-70b-versatile');
+----
+Model name set to: llama-3.3-70b-versatile
