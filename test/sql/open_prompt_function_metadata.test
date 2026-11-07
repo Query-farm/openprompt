@@ -1,0 +1,48 @@
+# name: test/sql/open_prompt_function_metadata.test
+# description: every open_prompt function has a description, examples, categories, parameter names and stability
+# group: [sql]
+
+require open_prompt
+
+# No function may lack a description, an example or a category
+query I
+SELECT list(DISTINCT function_name ORDER BY function_name) FROM duckdb_functions()
+WHERE extension_name = 'open_prompt'
+  AND (description IS NULL OR description = ''
+       OR examples IS NULL OR len(examples) = 0
+       OR categories IS NULL OR len(categories) = 0);
+----
+NULL
+
+query IIITTT
+SELECT function_name, function_type, parameters, parameter_types, return_type, stability FROM duckdb_functions()
+WHERE extension_name = 'open_prompt'
+ORDER BY function_name;
+----
+open_prompt	scalar	[prompt, model, json_schema, system_prompt, temperature, max_tokens]	[VARCHAR, VARCHAR, VARCHAR, VARCHAR, DOUBLE, INTEGER]	VARCHAR	VOLATILE
+set_api_timeout	scalar	[timeout_seconds]	[VARCHAR]	VARCHAR	VOLATILE
+set_api_token	scalar	[token]	[VARCHAR]	VARCHAR	VOLATILE
+set_api_url	scalar	[url]	[VARCHAR]	VARCHAR	VOLATILE
+set_model_name	scalar	[model]	[VARCHAR]	VARCHAR	VOLATILE
+
+query IT
+SELECT function_name, categories FROM duckdb_functions() WHERE extension_name = 'open_prompt' ORDER BY function_name;
+----
+open_prompt	[ai]
+set_api_timeout	[ai, configuration]
+set_api_token	[ai, configuration]
+set_api_url	[ai, configuration]
+set_model_name	[ai, configuration]
+
+# No parameter may fall back to a positional colN name
+query I
+SELECT count(*) FROM (SELECT unnest(parameters) AS p FROM duckdb_functions() WHERE extension_name = 'open_prompt')
+WHERE regexp_matches(p, '^col[0-9]+$');
+----
+0
+
+# set_api_token is documented as deprecated in favour of secrets
+query I
+SELECT description LIKE 'Deprecated%CREATE SECRET%' FROM duckdb_functions() WHERE function_name = 'set_api_token';
+----
+true

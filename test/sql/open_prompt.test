@@ -1,6 +1,6 @@
-# name: test/sql/rusty_quack.test
-# description: test rusty_quack extension
-# group: [quack]
+# name: test/sql/open_prompt.test
+# description: open_prompt offline behaviour: NULLs, validation, configuration, secrets, volatility
+# group: [sql]
 
 # Before we load the extension, this will fail
 statement error
@@ -8,24 +8,232 @@ SELECT open_prompt('error');
 ----
 Catalog Error: Scalar Function with name open_prompt does not exist!
 
-# Require statement will ensure the extension is loaded from now on
 require open_prompt
 
-# Confirm the extension works by setting a secret
-query I
-CREATE SECRET IF NOT EXISTS open_prompt (
-       TYPE open_prompt,
-       PROVIDER config,
-       api_token 'xxxxx',
-       api_url 'https://api.groq.com/openai/v1/chat/completions',
-       model_name 'llama-3.3-70b-versatile',
-       api_timeout '30'
-   );
+# Nothing listens on port 1, so any request that does go out fails instead of reaching a real API
+query T
+SELECT set_api_url('http://127.0.0.1:1/v1/chat/completions');
 ----
-true
+API URL set to: http://127.0.0.1:1/v1/chat/completions
 
-# Confirm the secret exists
+#----------------------------------------------------------------------
+# NULLs never touch the network
+#----------------------------------------------------------------------
+query T
+SELECT open_prompt(NULL);
+----
+NULL
+
+query T
+SELECT open_prompt(NULL::VARCHAR, 'some-model', '{"type":"object"}', 'system', 0.5, 10);
+----
+NULL
+
 query I
-SELECT name FROM duckdb_secrets() WHERE name = 'open_prompt' ;
+SELECT count(*) FROM (SELECT open_prompt(p) AS r FROM (VALUES (NULL::VARCHAR), (NULL)) t(p)) WHERE r IS NULL;
+----
+2
+
+#----------------------------------------------------------------------
+# Volatile: EXPLAIN and constant folding never call the API
+#----------------------------------------------------------------------
+statement ok
+EXPLAIN SELECT open_prompt('hello');
+
+statement ok
+PREPARE p AS SELECT open_prompt($1);
+
+query T
+SELECT stability FROM duckdb_functions() WHERE function_name = 'open_prompt';
+----
+VOLATILE
+
+# TRY() would re-send every request of a failing chunk, so DuckDB refuses it for volatile functions;
+# open_prompt_null_on_error is the alternative
+statement error
+SELECT TRY(open_prompt('hello'));
+----
+TRY can not be used in combination with a volatile function
+
+query T
+SELECT current_setting('open_prompt_null_on_error');
+----
+false
+
+#----------------------------------------------------------------------
+# Argument validation happens before any request is sent
+#----------------------------------------------------------------------
+statement error
+SELECT open_prompt('x', json_schema := '{not json');
+----
+json_schema is not valid JSON
+
+statement error
+SELECT open_prompt('x', json_schema := '[1, 2]');
+----
+json_schema must be a JSON object
+
+statement error
+SELECT open_prompt('x', temperature := -1);
+----
+temperature must be a non-negative number
+
+statement error
+SELECT open_prompt('x', max_tokens := 0);
+----
+max_tokens must be positive
+
+statement error
+SELECT open_prompt('x', model := '');
+----
+model must not be empty
+
+# A bad row in a column is reported, not silently replaced by row 0's arguments
+statement error
+SELECT open_prompt(p, json_schema := s) FROM (VALUES (NULL, '{"type":"object"}'), ('b', '{broken')) t(p, s);
+----
+json_schema is not valid JSON
+
+#----------------------------------------------------------------------
+# set_*() helpers
+#----------------------------------------------------------------------
+query T
+SELECT set_api_timeout('30');
+----
+API timeout set to: 30
+
+query T
+SELECT set_model_name('llama-3.3-70b-versatile');
+----
+Model name set to: llama-3.3-70b-versatile
+
+statement error
+SELECT set_api_timeout('abc');
+----
+must be a positive whole number of seconds
+
+statement error
+SELECT set_api_timeout('0');
+----
+must be a positive whole number of seconds
+
+statement error
+SELECT set_api_url('ftp://example.com/');
+----
+must start with http:// or https://
+
+statement error
+SELECT set_api_url('localhost:11434/v1/chat/completions');
+----
+must start with http:// or https://
+
+statement error
+SELECT set_model_name('');
+----
+Model name cannot be empty
+
+statement error
+SELECT set_api_token('');
+----
+API token cannot be empty
+
+query T
+SELECT set_model_name(NULL);
+----
+NULL
+
+# The token is never echoed back, and cannot be read back with getvariable() or duckdb_variables()
+query T
+SELECT set_api_token('sk-super-secret-token');
+----
+API token set
+
+query T
+SELECT getvariable('openprompt_api_token');
+----
+NULL
+
+query I
+SELECT count(*) FROM duckdb_variables() WHERE value::VARCHAR LIKE '%sk-super-secret%';
+----
+0
+
+# A bad timeout from the environment-free session config is reported when open_prompt runs
+statement ok
+SET VARIABLE openprompt_api_timeout = 'soon';
+
+statement error
+SELECT open_prompt('x');
+----
+the API timeout must be a positive whole number of seconds
+
+statement ok
+RESET VARIABLE openprompt_api_timeout;
+
+#----------------------------------------------------------------------
+# Secrets: the api_token is redacted, and a secret wins over set_*() session values
+#----------------------------------------------------------------------
+statement ok
+CREATE SECRET open_prompt (
+    TYPE open_prompt,
+    PROVIDER config,
+    api_token 'sk-secret-in-secret',
+    api_url 'http://127.0.0.1:1/v1/chat/completions',
+    model_name 'llama-3.3-70b-versatile',
+    api_timeout '30'
+);
+
+query I
+SELECT name FROM duckdb_secrets() WHERE name = 'open_prompt';
 ----
 open_prompt
+
+query I
+SELECT count(*) FROM duckdb_secrets() WHERE secret_string LIKE '%sk-secret-in-secret%';
+----
+0
+
+statement ok
+CREATE OR REPLACE SECRET open_prompt (TYPE open_prompt, api_timeout 'never');
+
+statement ok
+SELECT set_api_timeout('30');
+
+# The secret's (bad) timeout is used even though set_api_timeout() set a good one
+statement error
+SELECT open_prompt('x');
+----
+the secret's api_timeout must be a positive whole number of seconds
+
+# ... and the secret's URL wins over set_api_url()
+statement ok
+CREATE OR REPLACE SECRET open_prompt (TYPE open_prompt, api_url 'gopher://example.com');
+
+statement error
+SELECT open_prompt('x');
+----
+must start with http:// or https://
+
+# A secret scoped to another API URL does not apply
+statement ok
+CREATE OR REPLACE SECRET open_prompt (TYPE open_prompt, api_timeout 'never', SCOPE 'https://api.example.com/');
+
+statement error
+SELECT open_prompt('x', json_schema := 'nope');
+----
+json_schema is not valid JSON
+
+# ... but one scoped to the configured URL does
+statement ok
+CREATE SECRET open_prompt_local (TYPE open_prompt, api_timeout 'never', SCOPE 'http://127.0.0.1:1/');
+
+statement error
+SELECT open_prompt('x');
+----
+the secret's api_timeout must be a positive whole number of seconds
+
+statement ok
+DROP SECRET open_prompt_local;
+
+statement ok
+DROP SECRET open_prompt;

@@ -1,0 +1,27 @@
+# name: test/sql/open_prompt_external_access.test
+# description: open_prompt refuses to send requests when enable_external_access is false
+# group: [sql]
+
+require open_prompt
+
+statement ok
+SELECT set_api_url('http://127.0.0.1:1/v1/chat/completions');
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+SELECT open_prompt('hello');
+----
+open_prompt is disabled because enable_external_access is false
+
+statement error
+SELECT open_prompt(p) FROM (VALUES ('a'), ('b')) t(p);
+----
+open_prompt is disabled because enable_external_access is false
+
+# NULL prompts still give NULL
+query T
+SELECT open_prompt(NULL::VARCHAR);
+----
+NULL

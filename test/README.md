@@ -1,11 +1,17 @@
 # Testing this extension
-This directory contains all the tests for this extension. The `sql` directory holds tests that are written as [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html). DuckDB aims to have most its tests in this format as SQL statements, so for the quack extension, this should probably be the goal too.
 
-The root makefile contains targets to build and run all of these tests. To run the SQLLogicTests:
+The `sql` directory holds [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html). Run them with
+
 ```bash
-make test
+make test_release
 ```
-or 
+
+The default suite is offline. The tests that send real HTTP requests need httpfs, which is not part of this build,
+and are skipped unless these environment variables are set:
+
 ```bash
-make test_debug
+python3 test/fixture_server.py 8766 &   # a local OpenAI-compatible fixture API
+export OPEN_PROMPT_HTTPFS=httpfs        # or the path of an httpfs.duckdb_extension built for this DuckDB
+export OPEN_PROMPT_FIXTURE_URL=http://127.0.0.1:8766
+./build/release/test/unittest "test/sql/*"
 ```

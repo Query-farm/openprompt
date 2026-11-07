@@ -1,0 +1,51 @@
+# name: test/sql/open_prompt_network_errors.test
+# description: transport failures raise errors (or NULL with open_prompt_null_on_error) instead of returning "Error: ..." text
+# group: [sql]
+
+require open_prompt
+
+# The requests go through httpfs. It is not part of this build, so these tests are opt-in: set OPEN_PROMPT_HTTPFS to
+# `httpfs` (or the path of an httpfs.duckdb_extension file built for this DuckDB version).
+require-env OPEN_PROMPT_HTTPFS
+
+statement ok
+SET allow_extensions_metadata_mismatch = true;
+
+statement ok
+LOAD '{OPEN_PROMPT_HTTPFS}';
+
+statement ok
+SELECT set_api_url('http://127.0.0.1:1/v1/chat/completions');
+
+statement ok
+SET http_retries = 0;
+
+statement error
+SELECT open_prompt('hello');
+----
+open_prompt: HTTP POST to "http://127.0.0.1:1/v1/chat/completions" failed
+
+# open_prompt is volatile, so TRY() is refused (it would re-send requests); the setting gives NULL instead
+statement error
+SELECT TRY(open_prompt('hello'));
+----
+TRY can not be used in combination with a volatile function
+
+statement ok
+SET open_prompt_null_on_error = true;
+
+query T
+SELECT open_prompt('hello');
+----
+NULL
+
+query I
+SELECT count(*) FROM (SELECT open_prompt(p) AS r FROM (VALUES (NULL), ('a')) t(p)) WHERE r IS NULL;
+----
+2
+
+# Invalid arguments still raise
+statement error
+SELECT open_prompt('x', json_schema := '{bad');
+----
+json_schema is not valid JSON

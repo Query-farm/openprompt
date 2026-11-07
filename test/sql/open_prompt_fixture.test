@@ -1,0 +1,197 @@
+# name: test/sql/open_prompt_fixture.test
+# description: open_prompt against the local fixture server (python3 test/fixture_server.py)
+# group: [sql]
+
+require open_prompt
+
+# The requests go through httpfs. It is not part of this build, so these tests are opt-in: set OPEN_PROMPT_HTTPFS to
+# `httpfs` (or the path of an httpfs.duckdb_extension file built for this DuckDB version).
+require-env OPEN_PROMPT_HTTPFS
+
+require-env OPEN_PROMPT_FIXTURE_URL
+
+require json
+
+statement ok
+SET allow_extensions_metadata_mismatch = true;
+
+statement ok
+LOAD '{OPEN_PROMPT_HTTPFS}';
+
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/v1/chat/completions');
+
+statement ok
+SELECT set_model_name('session-model');
+
+# The fixture replies with a JSON summary of the request it received
+query T
+SELECT open_prompt('hello');
+----
+{"messages":[{"content":"hello","role":"user"}],"model":"session-model"}
+
+# Every optional argument, by name
+query T
+SELECT open_prompt('hi', model := 'm1', system_prompt := 'be terse', temperature := 0.25, max_tokens := 7);
+----
+{"max_tokens":7,"messages":[{"content":"be terse","role":"system"},{"content":"hi","role":"user"}],"model":"m1","temperature":0.25}
+
+# A JSON Schema is sent as OpenAI structured output
+query T
+SELECT open_prompt('x', json_schema := '{"type":"object","properties":{"a":{"type":"string"}}}')::JSON->'response_format';
+----
+{"json_schema":{"name":"response","schema":{"properties":{"a":{"type":"string"}},"type":"object"}},"type":"json_schema"}
+
+# A complete response_format is passed through as is (e.g. to ask for strict mode)
+query T
+SELECT open_prompt('x', json_schema := '{"type":"json_schema","json_schema":{"name":"n","strict":true,"schema":{"type":"object"}}}')::JSON->'response_format';
+----
+{"json_schema":{"name":"n","schema":{"type":"object"},"strict":true},"type":"json_schema"}
+
+query T
+SELECT open_prompt('x', json_schema := '{"type":"json_object"}')::JSON->'response_format';
+----
+{"type":"json_object"}
+
+# Per-row arguments: each row uses its own model, system prompt and schema (not row 0's)
+query IT
+SELECT i, open_prompt(p, model := m, system_prompt := s)::JSON->>'model' || '/' ||
+       coalesce(open_prompt(p, model := m, system_prompt := s)::JSON->'messages'->0->>'content', '')
+FROM (VALUES (1, 'a', 'model-a', 'sys-a'), (2, 'b', 'model-b', NULL), (3, 'c', NULL, 'sys-c')) t(i, p, m, s)
+ORDER BY i;
+----
+1	model-a/sys-a
+2	model-b/b
+3	session-model/sys-c
+
+# Unicode and quotes survive the round trip
+query T
+SELECT open_prompt('héllo "wörld" 🦆')::JSON->'messages'->0->>'content';
+----
+héllo "wörld" 🦆
+
+#----------------------------------------------------------------------
+# Tokens: no Authorization header without one; the secret wins over set_api_token()
+#----------------------------------------------------------------------
+query T
+SELECT open_prompt('x')::JSON->>'auth';
+----
+NULL
+
+statement ok
+SELECT set_api_token('session-token');
+
+query T
+SELECT open_prompt('x')::JSON->>'auth';
+----
+Bearer session-token
+
+statement ok
+CREATE SECRET op (TYPE open_prompt, api_token 'secret-token', model_name 'secret-model');
+
+query T
+SELECT open_prompt('x')::JSON->>'auth' || ' ' || (open_prompt('x')::JSON->>'model');
+----
+Bearer secret-token secret-model
+
+# The model argument still overrides the secret's model_name
+query T
+SELECT open_prompt('x', 'arg-model')::JSON->>'model';
+----
+arg-model
+
+statement ok
+DROP SECRET op;
+
+#----------------------------------------------------------------------
+# Errors are exceptions carrying the API's message; open_prompt_null_on_error gives NULL
+#----------------------------------------------------------------------
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/status/401');
+
+statement error
+SELECT open_prompt('x');
+----
+HTTP 401 (Unauthorized) from "{OPEN_PROMPT_FIXTURE_URL}/status/401": fixture error 401
+
+statement ok
+SET open_prompt_null_on_error = true;
+
+query T
+SELECT open_prompt('x');
+----
+NULL
+
+statement ok
+RESET open_prompt_null_on_error;
+
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/ollama-error');
+
+statement error
+SELECT open_prompt('x', 'nosuchmodel');
+----
+model 'nosuchmodel' not found
+
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/garbage');
+
+statement error
+SELECT open_prompt('x');
+----
+is not valid JSON
+
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/no-choices');
+
+statement error
+SELECT open_prompt('x');
+----
+has no message in its first choice
+
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/refusal');
+
+statement error
+SELECT open_prompt('x');
+----
+the model refused: I can't
+
+#----------------------------------------------------------------------
+# 429 is retried (http_retries times, honouring Retry-After)
+#----------------------------------------------------------------------
+statement ok
+SET http_retries = 3;
+
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/ratelimit/k1/2');
+
+query T
+SELECT open_prompt('after retries')::JSON->'messages'->0->>'content';
+----
+after retries
+
+statement ok
+SET http_retries = 1;
+
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/always-429');
+
+statement error
+SELECT open_prompt('x');
+----
+HTTP 429 (Too Many Requests)
+
+#----------------------------------------------------------------------
+# set_api_timeout applies
+#----------------------------------------------------------------------
+statement ok
+SELECT set_api_url('{OPEN_PROMPT_FIXTURE_URL}/v1/chat/completions');
+
+statement ok
+SELECT set_api_timeout('5');
+
+query T
+SELECT open_prompt('ok')::JSON->'messages'->0->>'content';
+----
+ok
