@@ -21,6 +21,11 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.hpp"
 
+#define LLM_RETRY_IMPLEMENTATION
+#include "llm_retry.hpp"
+#define LLM_CACHE_IMPLEMENTATION
+#include "llm_cache.hpp"
+
 #include <cstdlib>
 #include <algorithm>
 #include <cctype>
@@ -86,6 +91,32 @@ namespace duckdb
         return std::move(res);
     }
 
+    // Each thread executing open_prompt keeps a cache for the duration of the
+    // query, so rows that send an identical request (same URL, model, schema,
+    // system prompt and prompt) only call the API once.
+    struct OpenPromptLocalState : public FunctionLocalState
+    {
+        llm::ResponseCache cache;
+
+        static llm::CacheConfig MakeCacheConfig()
+        {
+            llm::CacheConfig config;
+            config.max_entries = 10000;
+            config.ttl_seconds = 0; // lives only as long as the query
+            config.case_sensitive = true;
+            return config;
+        }
+
+        OpenPromptLocalState() : cache(MakeCacheConfig()) {}
+    };
+
+    static unique_ptr<FunctionLocalState> OpenPromptInitLocalState(ExpressionState &state,
+                                                                   const BoundFunctionExpression &expr,
+                                                                   FunctionData *bind_data)
+    {
+        return make_uniq<OpenPromptLocalState>();
+    }
+
     static std::pair<duckdb_httplib_openssl::Client, std::string> SetupHttpClient(const std::string &url)
     {
         std::string scheme, domain, path, client_url;
@@ -126,23 +157,29 @@ namespace duckdb
         return std::make_pair(std::move(client), path);
     }
 
+    // Throws llm::LLMError so llm::with_retry can retry dropped connections and
+    // failed reads/writes; TLS, certificate and redirect errors are not retried.
     static void HandleHttpError(const duckdb_httplib_openssl::Result &res, const std::string &request_type)
     {
         std::string err_message = "HTTP " + request_type + " request failed. ";
+        bool retryable = false;
 
         switch (res.error())
         {
         case duckdb_httplib_openssl::Error::Connection:
             err_message += "Connection error.";
+            retryable = true;
             break;
         case duckdb_httplib_openssl::Error::BindIPAddress:
             err_message += "Failed to bind IP address.";
             break;
         case duckdb_httplib_openssl::Error::Read:
             err_message += "Error reading response.";
+            retryable = true;
             break;
         case duckdb_httplib_openssl::Error::Write:
             err_message += "Error writing request.";
+            retryable = true;
             break;
         case duckdb_httplib_openssl::Error::ExceedRedirectCount:
             err_message += "Too many redirects.";
@@ -169,7 +206,24 @@ namespace duckdb
             err_message += "Unknown error.";
             break;
         }
-        throw std::runtime_error(err_message);
+        throw llm::LLMError{0, err_message, retryable};
+    }
+
+    // Non-200 responses. llm::with_retry retries 408, 429 and 5xx (waiting for
+    // Retry-After when the server sends it, capped at 30s) and gives up at once
+    // on other codes such as 400 or 401.
+    static void HandleHttpStatus(const duckdb_httplib_openssl::Response &res)
+    {
+        double retry_after_seconds = -1.0;
+        auto retry_after = res.get_header_value("Retry-After");
+        if (!retry_after.empty() && retry_after.size() < 6 &&
+            std::all_of(retry_after.begin(), retry_after.end(), [](unsigned char c)
+                        { return std::isdigit(c) != 0; }))
+        {
+            retry_after_seconds = std::min(std::stod(retry_after), 30.0);
+        }
+        throw llm::LLMError{res.status, "HTTP error " + std::to_string(res.status) + ": " + res.reason, true,
+                            retry_after_seconds};
     }
 
     // Settings management
@@ -297,6 +351,9 @@ namespace duckdb
     {
         D_ASSERT(args.data.size() >= 1); // At least prompt required
 
+        auto local_state = ExecuteFunctionState::GetFunctionState(state);
+        llm::ResponseCache *cache = local_state ? &local_state->Cast<OpenPromptLocalState>().cache : nullptr;
+
         UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(),
                                                    [&](string_t user_prompt)
                                                    {
@@ -375,6 +432,16 @@ namespace duckdb
                                                        string str_request_body(request_body);
                                                        free(request_body);
 
+                                                       const std::string cache_key = api_url + "\n" + str_request_body;
+                                                       if (cache)
+                                                       {
+                                                           auto cached = cache->get(cache_key);
+                                                           if (cached)
+                                                           {
+                                                               return StringVector::AddString(result, *cached);
+                                                           }
+                                                       }
+
                                                        try
                                                        {
                                                            auto client_and_path = SetupHttpClient(api_url);
@@ -393,22 +460,29 @@ namespace duckdb
                                                                client.set_read_timeout(stoi(api_timeout), 0);
                                                            }
 
-                                                           auto res = client.Post(path.c_str(), headers, str_request_body, "application/json");
-
-                                                           if (!res)
+                                                           // Up to 3 attempts with exponential backoff (llm::RetryConfig defaults)
+                                                           std::function<std::string()> post = [&]() -> std::string
                                                            {
-                                                               HandleHttpError(res, "POST");
-                                                           }
+                                                               auto res = client.Post(path.c_str(), headers, str_request_body, "application/json");
 
-                                                           if (res->status != 200)
-                                                           {
-                                                               throw std::runtime_error("HTTP error " + std::to_string(res->status) + ": " + res->reason);
-                                                           }
+                                                               if (!res)
+                                                               {
+                                                                   HandleHttpError(res, "POST");
+                                                               }
+
+                                                               if (res->status != 200)
+                                                               {
+                                                                   HandleHttpStatus(*res);
+                                                               }
+
+                                                               return res->body;
+                                                           };
+                                                           std::string response_body = llm::with_retry<std::string>(post).value;
 
                                                            try
                                                            {
                                                                unique_ptr<duckdb_yyjson::yyjson_doc, void (*)(duckdb_yyjson::yyjson_doc *)> doc(
-                                                                   duckdb_yyjson::yyjson_read(res->body.c_str(), res->body.length(), 0),
+                                                                   duckdb_yyjson::yyjson_read(response_body.c_str(), response_body.length(), 0),
                                                                    &duckdb_yyjson::yyjson_doc_free);
 
                                                                if (!doc)
@@ -452,12 +526,20 @@ namespace duckdb
                                                                    throw std::runtime_error("Invalid content in response");
                                                                }
 
+                                                               if (cache)
+                                                               {
+                                                                   cache->put(cache_key, content_str);
+                                                               }
                                                                return StringVector::AddString(result, content_str);
                                                            }
                                                            catch (std::exception &e)
                                                            {
                                                                throw std::runtime_error("Failed to parse response: " + std::string(e.what()));
                                                            }
+                                                       }
+                                                       catch (llm::LLMError &e)
+                                                       {
+                                                           return StringVector::AddString(result, "Error: " + e.message);
                                                        }
                                                        catch (std::exception &e)
                                                        {
@@ -486,6 +568,11 @@ namespace duckdb
         // Four arguments: prompt + model + json_schema + system_prompt
         open_prompt_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
                                                    LogicalType::VARCHAR, OpenPromptRequestFunction, OpenPromptBind));
+
+        for (auto &function : open_prompt_set.functions)
+        {
+            function.SetInitStateCallback(OpenPromptInitLocalState);
+        }
 
         // Create function info with documentation
         CreateScalarFunctionInfo open_prompt_info(open_prompt_set);

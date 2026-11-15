@@ -12,7 +12,11 @@ set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
-include_directories(src/include duckdb/third_party/httplib)
+include_directories(src/include duckdb/third_party/httplib third_party/llm)
+
+# third_party/llm (llm_retry.hpp, llm_cache.hpp) needs C++17. This only applies
+# to the targets defined in this directory, not to DuckDB itself.
+set(CMAKE_CXX_STANDARD 17)
 
 set(EXTENSION_SOURCES src/open_prompt_extension.cpp src/open_prompt_secret.cpp src/query_farm_telemetry.cpp)
 
